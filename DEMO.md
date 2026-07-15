@@ -29,13 +29,38 @@ Vapi → George assistant → tool `lookup_spec` → Server URL:
 https://YOUR-NGROK-HOST/vapi-tool
 ```
 
-Current local tunnel when started from this machine often looks like:
+## Vapi setup (stops “what year?” loops)
+
+### Tool `lookup_spec` parameters
+
+| Param | Required? | Notes |
+| --- | --- | --- |
+| `query` | **Yes** | What they’re asking |
+| `make` | No | e.g. chevrolet / nissan |
+| `model` | No | e.g. silverado / vr30 |
+| `year` | **No** | Uncheck required in Vapi |
+
+If the tech says “AMS VR30”, the API infers `nissan` / `vr30` / `2016`. If they say “2019 Silverado”, it infers Chevy tags.
+
+### Paste into Assistant **System Prompt**
 
 ```text
-https://unmanned-rundown-denim.ngrok-free.dev/vapi-tool
+You are George, a shop-floor automotive voice assistant.
+
+RULES:
+1. For any torque, fastener, gasket, or install-spec question, ALWAYS call lookup_spec first.
+2. Pass query = the mechanic's question. Pass make/model/year only if the mechanic said them. Do NOT ask for year if they already named the vehicle (Silverado, VR30, AMS, etc.).
+3. After lookup_spec returns a result, speak that result almost word-for-word. Do not ask clarifying questions after a successful lookup.
+4. Never shorten units. Keep "foot-pounds", "inch-pounds", "newton-meters" exactly.
+5. Keep answers to 1-2 short sentences. No filler.
+6. Only ask for year/make/model if the tool returns an error AND the vehicle is truly unknown.
 ```
 
-(Free ngrok hostnames can change — always copy from the running ngrok UI/logs.)
+### Tool description (paste on the tool)
+
+```text
+Looks up torque and fastener specs from shop manuals. Pass query always. make, model, and year are optional — omit year rather than asking the user when the platform is clear (e.g. VR30/AMS → Nissan VR30; Silverado → Chevrolet). Speak the returned result string exactly; do not invent values.
+```
 
 ## Re-seed (credit-safe)
 
@@ -45,12 +70,6 @@ https://unmanned-rundown-denim.ngrok-free.dev/vapi-tool
 
 .venv/bin/python ingest.py "AMS Performance VR30 Guide.pdf" \
   --year 2016 --make nissan --model vr30
-```
-
-Only if a PDF file itself changed:
-
-```bash
-.venv/bin/python ingest.py "path/to/file.pdf" --year YYYY --make MAKE --model MODEL --force-parse
 ```
 
 After ingest, restart uvicorn.
@@ -68,7 +87,7 @@ After ingest, restart uvicorn.
 ```bash
 curl -s -X POST "http://127.0.0.1:8000/vapi-tool" \
   -H "Content-Type: application/json" \
-  -d '{"query":"lower intake manifold torque","make":"Nissan","model":"vr30","year":"2016"}'
+  -d '{"query":"lower intake manifold torque AMS VR30"}'
 ```
 
 ## Credit rules

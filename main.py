@@ -675,9 +675,46 @@ app = FastAPI(
 )
 
 
+def _infer_vehicle_fields(
+    query: str,
+    make: str,
+    model: str,
+    year: str,
+) -> tuple[str, str, str]:
+    """Fill missing make/model/year from query keywords for known manuals."""
+    q = query.lower()
+    make_out, model_out, year_out = make, model, year
+
+    if any(token in q for token in ("vr30", "ams", "q50", "q60", "infiniti")):
+        if not make_out:
+            make_out = "nissan"
+        if not model_out:
+            model_out = "vr30"
+        if not year_out:
+            year_out = "2016"
+
+    if "silverado" in q or ("chevy" in q) or ("chevrolet" in q):
+        if not make_out:
+            make_out = "chevrolet"
+        if not model_out and "silverado" in q:
+            model_out = "silverado"
+        if not year_out and "2019" in q:
+            year_out = "2019"
+        # Default Chevy demo vehicle when Silverado is named without a year.
+        if not year_out and model_out == "silverado":
+            year_out = "2019"
+
+    return make_out, model_out, year_out
+
+
 @app.post("/vapi-tool")
 async def vapi_tool(request: Request) -> JSONResponse:
-    """Accept flat apiRequest body: {query, make, model, year}."""
+    """Accept flat apiRequest body: {query, make, model, year}.
+
+    Only ``query`` is required. Missing vehicle fields are inferred from the
+    query when possible so the voice agent does not need to interrogate the
+    tech for year/make/model on every turn.
+    """
     try:
         payload = await request.json()
     except Exception:  # noqa: BLE001 - still return Vapi-shaped 200
@@ -711,32 +748,20 @@ async def vapi_tool(request: Request) -> JSONResponse:
     model = str(payload.get("model") or "").strip().lower()
     year = str(payload.get("year") or "").strip().lower()
 
-    missing = [
-        name
-        for name, value in (
-            ("query", query),
-            ("make", make),
-            ("model", model),
-            ("year", year),
-        )
-        if not value
-    ]
-    if missing:
+    if not query:
         return JSONResponse(
             status_code=200,
             content={
                 "results": [
                     {
                         "toolCallId": "vapi-call",
-                        "error": (
-                            "Missing required fields: "
-                            + ", ".join(missing)
-                            + "."
-                        ),
+                        "error": "Missing required field: query.",
                     }
                 ]
             },
         )
+
+    make, model, year = _infer_vehicle_fields(query, make, model, year)
 
     client: QdrantClient = request.app.state.qdrant
     embedder: TextEmbedding = request.app.state.embedder
