@@ -12,6 +12,7 @@ import asyncio
 import logging
 import os
 import re
+import tempfile
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -20,11 +21,24 @@ from typing import Any, Sequence
 
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request
+from fastapi import BackgroundTasks, FastAPI, File, Form, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastembed import TextEmbedding
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
+
+from ingest import (
+    VehicleMetadata,
+    build_points,
+    collect_spec_chunks,
+    delete_points_for_document,
+    document_ref_from_path,
+    ensure_collection,
+    expand_mechanical_units,
+    load_api_key,
+    parse_pdf_to_markdown,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 load_dotenv(PROJECT_ROOT / ".env")
@@ -79,27 +93,6 @@ _SEQUENCE_QUERY_HINTS = (
     "tightening order",
     "torque sequence",
     "bolt order",
-)
-
-_UNIT_EXPANSION_RULES: Sequence[tuple[re.Pattern[str], str]] = (
-    (re.compile(r"\blb\.\s*ft\.", re.IGNORECASE), "foot-pounds"),
-    (re.compile(r"\blb\.\s*ft\b", re.IGNORECASE), "foot-pounds"),
-    (re.compile(r"\blb\.\-ft\.?", re.IGNORECASE), "foot-pounds"),
-    (re.compile(r"\blb\s*-\s*ft\.?\b", re.IGNORECASE), "foot-pounds"),
-    (re.compile(r"\bft\.\s*lb\.?", re.IGNORECASE), "foot-pounds"),
-    (re.compile(r"\bft\s*-\s*lb\.?\b", re.IGNORECASE), "foot-pounds"),
-    (re.compile(r"\bft\s+lbs?\b", re.IGNORECASE), "foot-pounds"),
-    (re.compile(r"(?<=\d)ft\s*lbs?\b", re.IGNORECASE), " foot-pounds"),
-    (re.compile(r"\blb\.\s*in\.", re.IGNORECASE), "inch-pounds"),
-    (re.compile(r"\blb\.\s*in\b", re.IGNORECASE), "inch-pounds"),
-    (re.compile(r"\blb\.\-in\.?", re.IGNORECASE), "inch-pounds"),
-    (re.compile(r"\blb\s*-\s*in\.?\b", re.IGNORECASE), "inch-pounds"),
-    (re.compile(r"\bin\.\s*lb\.?", re.IGNORECASE), "inch-pounds"),
-    (re.compile(r"\bin\s*-\s*lb\.?\b", re.IGNORECASE), "inch-pounds"),
-    (re.compile(r"\bin\s+lbs?\b", re.IGNORECASE), "inch-pounds"),
-    (re.compile(r"\bN\s*[·•\.]\s*m\b"), "newton-meters"),
-    (re.compile(r"\bN\s*-\s*m\b"), "newton-meters"),
-    (re.compile(r"\bNm\b"), "newton-meters"),
 )
 
 _TABLE_ROW_RE = re.compile(r"^\s*\|.*\|\s*$")
@@ -298,6 +291,20 @@ def _extract_call_id(payload: dict[str, Any]) -> str:
     return ""
 
 
+def _extract_tool_call_id(payload: dict[str, Any]) -> str:
+    """Prefer Vapi toolCall.id; never confuse with session callId."""
+    for key in ("toolCallId", "tool_call_id"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+    tool_calls = extract_tool_call_list(payload)
+    if tool_calls:
+        return extract_tool_call_id(tool_calls[0], 0)
+
+    return "vapi-call"
+
+
 def _get_or_create_session(call_id: str) -> CallSession | None:
     if not call_id:
         return None
@@ -381,13 +388,6 @@ def format_number_for_speech(text: str) -> str:
         return " ".join(digits)
 
     return _PART_NUMBER_RUN_RE.sub(_replace_run, text or "")
-
-
-def expand_mechanical_units(text: str) -> str:
-    expanded = text
-    for pattern, replacement in _UNIT_EXPANSION_RULES:
-        expanded = pattern.sub(replacement, expanded)
-    return expanded
 
 
 def _split_table_cells(row: str) -> list[str]:
@@ -1156,11 +1156,158 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 @app.get("/health")
 async def health() -> dict[str, str]:
     """Liveness endpoint for Render / load balancers."""
     return {"status": "ok", "service": "george"}
+
+
+async def _ingest_upload_job(
+    temp_path: Path,
+    year: str,
+    make: str,
+    model: str,
+    shop_id: str,
+    embedder: TextEmbedding,
+    client: QdrantClient,
+) -> None:
+    """Background: LlamaParse → chunks → embed → Qdrant upsert, then delete temp."""
+    tenant = (shop_id or DEFAULT_SHOP_ID).strip().lower() or DEFAULT_SHOP_ID
+    try:
+        api_key = load_api_key()
+        logger.info("upload job start path=%s shop_id=%s", temp_path.name, tenant)
+        markdown = await parse_pdf_to_markdown(
+            temp_path,
+            api_key,
+            force_parse=True,
+            premium_mode=False,
+        )
+        markdown = expand_mechanical_units(markdown)
+        chunks = collect_spec_chunks(markdown)
+        if not chunks:
+            logger.error(
+                "upload job produced no chunks for %s — nothing upserted",
+                temp_path.name,
+            )
+            return
+
+        metadata = VehicleMetadata(
+            year=year,
+            make=make,
+            model=model,
+            document_ref=document_ref_from_path(temp_path),
+            shop_id=tenant,
+        )
+
+        def _sync_upsert() -> int:
+            ensure_collection(client)
+            delete_points_for_document(
+                client,
+                document_ref=metadata.document_ref,
+                shop_id=tenant,
+            )
+            points = build_points(chunks, metadata, embedder)
+            if points:
+                client.upsert(collection_name=COLLECTION_NAME, points=list(points))
+            invalidate_shop_catalog(tenant)
+            return len(points)
+
+        count = await asyncio.to_thread(_sync_upsert)
+        logger.info(
+            "upload job done document_ref=%s shop_id=%s points=%d",
+            metadata.document_ref,
+            tenant,
+            count,
+        )
+    except SystemExit as exc:
+        logger.error(
+            "upload job aborted path=%s shop_id=%s err=%s",
+            temp_path,
+            tenant,
+            exc,
+        )
+    except Exception:
+        logger.exception("upload job failed path=%s shop_id=%s", temp_path, tenant)
+    finally:
+        try:
+            temp_path.unlink(missing_ok=True)
+            parent = temp_path.parent
+            if parent.name.startswith("george_upload_"):
+                parent.rmdir()
+        except OSError:
+            logger.warning("could not delete temp upload %s", temp_path)
+
+
+@app.post("/upload")
+async def upload_manual(
+    background_tasks: BackgroundTasks,
+    request: Request,
+    file: UploadFile = File(...),
+    year: str = Form(...),
+    make: str = Form(...),
+    model: str = Form(...),
+    shop_id: str = Form(DEFAULT_SHOP_ID),
+) -> JSONResponse:
+    """Accept a PDF and ingest it into Qdrant in the background."""
+    if not year.strip() or not make.strip() or not model.strip():
+        return JSONResponse(
+            status_code=400,
+            content={"detail": "year, make, and model are required."},
+        )
+
+    filename = (file.filename or "upload.pdf").strip()
+    if not filename.lower().endswith(".pdf"):
+        return JSONResponse(
+            status_code=400,
+            content={"detail": "Only PDF uploads are supported."},
+        )
+
+    safe_name = Path(filename).name
+    tmp_dir = Path(tempfile.mkdtemp(prefix="george_upload_"))
+    temp_path = tmp_dir / safe_name
+    try:
+        with temp_path.open("wb") as out:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                out.write(chunk)
+    finally:
+        await file.close()
+
+    client: QdrantClient = request.app.state.qdrant
+    embedder: TextEmbedding = request.app.state.embedder
+    background_tasks.add_task(
+        _ingest_upload_job,
+        temp_path,
+        year.strip(),
+        make.strip(),
+        model.strip(),
+        (shop_id or DEFAULT_SHOP_ID).strip() or DEFAULT_SHOP_ID,
+        embedder,
+        client,
+    )
+    return JSONResponse(
+        status_code=202,
+        content={
+            "status": "accepted",
+            "message": "Manual queued for ingest.",
+            "filename": safe_name,
+            "shop_id": (shop_id or DEFAULT_SHOP_ID).strip().lower() or DEFAULT_SHOP_ID,
+            "year": year.strip().lower(),
+            "make": make.strip().lower(),
+            "model": model.strip().lower(),
+        },
+    )
 
 
 def _infer_vehicle_fields(
@@ -1282,6 +1429,7 @@ async def vapi_tool(request: Request) -> JSONResponse:
     year = str(payload.get("year") or "").strip().lower()
     shop_id = str(payload.get("shop_id") or "").strip().lower() or DEFAULT_SHOP_ID
     call_id = _extract_call_id(payload)
+    tool_call_id = _extract_tool_call_id(payload)
 
     if not query:
         return JSONResponse(
@@ -1289,7 +1437,7 @@ async def vapi_tool(request: Request) -> JSONResponse:
             content={
                 "results": [
                     {
-                        "toolCallId": "vapi-call",
+                        "toolCallId": tool_call_id,
                         "error": "Missing required field: query.",
                     }
                 ]
@@ -1312,7 +1460,9 @@ async def vapi_tool(request: Request) -> JSONResponse:
 
         client: QdrantClient = request.app.state.qdrant
         embedder: TextEmbedding = request.app.state.embedder
-        catalog = get_shop_vehicle_catalog(client, shop_id)
+        catalog = await asyncio.to_thread(
+            get_shop_vehicle_catalog, client, shop_id
+        )
         make, model, year = _infer_vehicle_fields(
             query, make, model, year, catalog
         )
@@ -1335,7 +1485,7 @@ async def vapi_tool(request: Request) -> JSONResponse:
                 content={
                     "results": [
                         {
-                            "toolCallId": "vapi-call",
+                            "toolCallId": tool_call_id,
                             "error": f"Specification lookup failed: {exc}.",
                         }
                     ]
@@ -1344,18 +1494,24 @@ async def vapi_tool(request: Request) -> JSONResponse:
 
         if chunk_text is None:
             outcome = "not_found"
-            # Hard fail when every hybrid pass misses for this shop_id.
             return JSONResponse(
                 status_code=200,
                 content={
-                    "result": (
-                        "ERROR: SPEC_NOT_FOUND. I do not have that "
-                        "spec in the manuals."
-                    )
+                    "results": [
+                        {
+                            "toolCallId": tool_call_id,
+                            "result": (
+                                "I don't see that specification anywhere "
+                                "in my current manuals."
+                            ),
+                        }
+                    ]
                 },
             )
 
-        spoken_result = format_voice_answer(chunk_text, query)
+        spoken_result = await asyncio.to_thread(
+            format_voice_answer, chunk_text, query
+        )
         if not spoken_result:
             outcome = "format_failed"
             return JSONResponse(
@@ -1363,7 +1519,7 @@ async def vapi_tool(request: Request) -> JSONResponse:
                 content={
                     "results": [
                         {
-                            "toolCallId": "vapi-call",
+                            "toolCallId": tool_call_id,
                             "error": (
                                 "Specification found but could not be formatted "
                                 "for speech."
@@ -1379,7 +1535,7 @@ async def vapi_tool(request: Request) -> JSONResponse:
             content={
                 "results": [
                     {
-                        "toolCallId": "vapi-call",
+                        "toolCallId": tool_call_id,
                         "result": format_number_for_speech(
                             to_single_line(spoken_result)
                         ),
