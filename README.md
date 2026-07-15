@@ -105,7 +105,7 @@ python ingest.py "AMS Performance VR30 Guide.pdf" --year 2016 --make nissan --mo
          Vapi TTS → mechanic
 ```
 
-## Quick start (Call test)
+## Quick start (local Call test)
 
 ```bash
 # Terminal 1
@@ -119,16 +119,48 @@ Vapi tool `lookup_spec` Server URL: `https://YOUR-NGROK-HOST/vapi-tool`
 
 See [DEMO.md](DEMO.md) for smoke questions and curl examples.
 
+## Deploy API on Render
+
+The live webhook is [`main.py`](main.py). Ingest stays on your laptop (or CI) against Qdrant Cloud — do **not** run `ingest.py` as the Render web process.
+
+1. Push this repo to GitHub (secrets stay in Render env vars, never in git).
+2. [Render](https://dashboard.render.com) → **New** → **Blueprint** (uses [`render.yaml`](render.yaml))  
+   or **Web Service** from the repo with:
+   - **Build:** `pip install -r requirements.txt`
+   - **Start:** `uvicorn main:app --host 0.0.0.0 --port $PORT`
+   - **Health check path:** `/health`
+3. Set environment variables (Dashboard → Environment):
+
+| Variable | Required on Render |
+| --- | --- |
+| `QDRANT_URL` | Yes |
+| `QDRANT_API_KEY` | Yes |
+| `VAPI_WEBHOOK_SECRET` | Yes (match Vapi `X-Vapi-Secret` header) |
+| `LLAMA_CLOUD_API_KEY` | No (ingest only) |
+
+4. First boot downloads the FastEmbed model — expect a slow deploy / cold start.
+5. Point Vapi `lookup_spec` Server URL to:
+   `https://YOUR-SERVICE.onrender.com/vapi-tool`  
+   Keep the `X-Vapi-Secret` header equal to `VAPI_WEBHOOK_SECRET`.
+6. Smoke test:
+   ```bash
+   curl -s https://YOUR-SERVICE.onrender.com/health
+   curl -s -X POST https://YOUR-SERVICE.onrender.com/vapi-tool \
+     -H "Content-Type: application/json" \
+     -H "x-vapi-secret: YOUR_SECRET" \
+     -d '{"query":"lower intake manifold torque AMS VR30"}'
+   ```
+
 ## Stack
 
 | Layer | Choice |
 | --- | --- |
 | Parse | LlamaParse (`cost_effective`) + local `.george_parse_cache/` |
-| Embed | FastEmbed local CPU |
-| Store | File Qdrant `./george_mvp_db` / `george_specs` |
-| API | FastAPI |
+| Embed | FastEmbed local CPU (also on Render) |
+| Store | Qdrant Cloud `george_specs` (local `./george_mvp_db` for offline only) |
+| API | FastAPI on Render |
 | Voice | Vapi (WebRTC + STT/TTS) |
-| Tunnel | Ngrok (dev) |
+| Tunnel | Ngrok (local dev only) |
 
 ## Design rules
 
@@ -136,7 +168,8 @@ See [DEMO.md](DEMO.md) for smoke questions and curl examples.
 - **Units:** always `foot-pounds` / `inch-pounds` / `newton-meters`
 - **Tables:** never clip across chunk boundaries
 - **Credits:** cache-first; never force-parse unless the PDF changed
+- **Tenancy:** every vector and every search is scoped by `shop_id` (default `shop_demo`)
 
 ## What’s next
 
-Frontend bay picker, hosted API + managed Qdrant, persistent public URL — after multi-PDF Call demos stay green.
+Minimal Start Call UI + persistent job/transcript review — after hosted `/vapi-tool` stays green.

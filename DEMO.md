@@ -26,7 +26,11 @@ ngrok http 8000
 Vapi → George assistant → tool `lookup_spec` → Server URL:
 
 ```text
+# Local demo
 https://YOUR-NGROK-HOST/vapi-tool
+
+# Production (Render)
+https://YOUR-SERVICE.onrender.com/vapi-tool
 ```
 
 ## Vapi webhook secret (`x-vapi-secret`)

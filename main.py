@@ -34,6 +34,7 @@ logger = logging.getLogger("george.main")
 QDRANT_PATH = PROJECT_ROOT / "george_mvp_db"
 COLLECTION_NAME = "george_specs"
 EMBEDDING_MODEL_NAME = "BAAI/bge-small-en-v1.5"
+DEFAULT_SHOP_ID = "shop_demo"
 
 # In-memory vehicle context keyed by Vapi callId (single-process demo/prod hop).
 _CALL_SESSIONS: dict[str, "CallSession"] = {}
@@ -596,6 +597,14 @@ def _search_points(
     return list(response.points)
 
 
+def _shop_id_condition(shop_id: str) -> qmodels.FieldCondition:
+    tenant = (shop_id or DEFAULT_SHOP_ID).strip().lower() or DEFAULT_SHOP_ID
+    return qmodels.FieldCondition(
+        key="shop_id",
+        match=qmodels.MatchValue(value=tenant),
+    )
+
+
 def _search_top_chunk_sync(
     client: QdrantClient,
     embedder: TextEmbedding,
@@ -603,14 +612,17 @@ def _search_top_chunk_sync(
     year: str,
     make: str,
     model: str,
+    shop_id: str = DEFAULT_SHOP_ID,
 ) -> str | None:
     """Hybrid retrieval: exact metadata first, then soft match, then semantic.
 
-    Exact year/make/model matches are preferred when present in Qdrant, but
-    mismatched or fuzzy vehicle strings still return the closest technical
-    chunk via unfiltered vector similarity. Sync — call via
-    ``search_top_chunk`` so FastAPI never blocks the event loop.
+    ``shop_id`` is a mandatory must-filter on every pass so tenants cannot
+    retrieve each other's manuals. Sync — call via ``search_top_chunk`` so
+    FastAPI never blocks the event loop.
     """
+    tenant = (shop_id or DEFAULT_SHOP_ID).strip().lower() or DEFAULT_SHOP_ID
+    shop_must = [_shop_id_condition(tenant)]
+
     query_vector = _query_vector_for(embedder, query, year, make, model)
     if query_vector is None:
         return None
@@ -619,6 +631,7 @@ def _search_top_chunk_sync(
     if year and make and model:
         strict_filter = qmodels.Filter(
             must=[
+                *shop_must,
                 qmodels.FieldCondition(
                     key="year",
                     match=qmodels.MatchValue(value=year),
@@ -638,7 +651,7 @@ def _search_top_chunk_sync(
         if text:
             return text
 
-    # Pass 2 — soft OR filter: any provided vehicle field may match.
+    # Pass 2 — soft OR on vehicle fields, still locked to shop_id.
     soft_should: list[qmodels.FieldCondition] = []
     if year:
         soft_should.append(
@@ -663,6 +676,7 @@ def _search_top_chunk_sync(
         )
     if soft_should:
         soft_filter = qmodels.Filter(
+            must=shop_must,
             min_should=qmodels.MinShould(
                 conditions=soft_should,
                 min_count=1,
@@ -672,8 +686,10 @@ def _search_top_chunk_sync(
         text = _payload_text(hits[0]) if hits else None
         if text:
             return text
-    # Pass 3 — pure semantic fallback (no metadata lock).
-    hits = _search_points(client, query_vector, query_filter=None, limit=1)
+
+    # Pass 3 — semantic fallback still restricted to this shop's corpus.
+    tenant_filter = qmodels.Filter(must=shop_must)
+    hits = _search_points(client, query_vector, query_filter=tenant_filter, limit=1)
     if not hits:
         return None
     return _payload_text(hits[0])
@@ -686,6 +702,7 @@ async def search_top_chunk(
     year: str,
     make: str,
     model: str,
+    shop_id: str = DEFAULT_SHOP_ID,
 ) -> str | None:
     """Run hybrid retrieval off the event loop (embed + Qdrant are sync)."""
     return await asyncio.to_thread(
@@ -696,6 +713,7 @@ async def search_top_chunk(
         year,
         make,
         model,
+        shop_id,
     )
 
 
@@ -818,6 +836,7 @@ def handle_tool_call(
             year=args["year"],
             make=args["make"],
             model=args["model"],
+            shop_id=DEFAULT_SHOP_ID,
         )
     except Exception as exc:  # noqa: BLE001 - surface as Vapi tool error string
         return SpokenAnswer(
@@ -854,20 +873,27 @@ async def lifespan(app: FastAPI):
     logger.setLevel(logging.INFO)
     logger.info("George webhook starting up")
 
-    embedder = TextEmbedding(model_name=EMBEDDING_MODEL_NAME)
-
+    # On Render, cloud Qdrant is mandatory — never fall back to a missing local path.
+    on_render = bool((os.getenv("RENDER") or "").strip())
     qdrant_url = (os.getenv("QDRANT_URL") or "").strip()
     qdrant_api_key = (os.getenv("QDRANT_API_KEY") or "").strip()
 
+    if on_render and not (qdrant_url and qdrant_api_key):
+        raise RuntimeError(
+            "Render deploy requires QDRANT_URL and QDRANT_API_KEY environment variables."
+        )
+
+    embedder = TextEmbedding(model_name=EMBEDDING_MODEL_NAME)
+
     if qdrant_url and qdrant_api_key:
-        client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key)
+        client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key, timeout=10.0)
         collection_location = qdrant_url
     else:
         if not QDRANT_PATH.exists():
             raise RuntimeError(
                 f"Qdrant path does not exist: {QDRANT_PATH}. Run ingest.py first."
             )
-        client = QdrantClient(path=str(QDRANT_PATH))
+        client = QdrantClient(path=str(QDRANT_PATH), timeout=10.0)
         collection_location = str(QDRANT_PATH)
 
     if not client.collection_exists(COLLECTION_NAME):
@@ -892,6 +918,12 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+
+@app.get("/health")
+async def health() -> dict[str, str]:
+    """Liveness endpoint for Render / load balancers."""
+    return {"status": "ok", "service": "george"}
 
 
 def _infer_vehicle_fields(
@@ -979,6 +1011,7 @@ async def vapi_tool(request: Request) -> JSONResponse:
     make = str(payload.get("make") or "").strip().lower()
     model = str(payload.get("model") or "").strip().lower()
     year = str(payload.get("year") or "").strip().lower()
+    shop_id = str(payload.get("shop_id") or "").strip().lower() or DEFAULT_SHOP_ID
     call_id = _extract_call_id(payload)
 
     if not query:
@@ -1022,6 +1055,7 @@ async def vapi_tool(request: Request) -> JSONResponse:
                 year=year,
                 make=make,
                 model=model,
+                shop_id=shop_id,
             )
         except Exception as exc:  # noqa: BLE001 - surface as tool error string
             outcome = "lookup_failed"
@@ -1088,15 +1122,18 @@ async def vapi_tool(request: Request) -> JSONResponse:
     finally:
         elapsed_ms = (time.perf_counter() - started) * 1000.0
         logger.info(
-            "vapi_tool outcome=%s elapsed_ms=%.1f query=%r year=%r make=%r model=%r",
+            "vapi_tool outcome=%s elapsed_ms=%.1f query=%r year=%r make=%r "
+            "model=%r shop_id=%r",
             outcome,
             elapsed_ms,
             query,
             year or None,
             make or None,
             model or None,
+            shop_id,
         )
 
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
+    port = int((os.getenv("PORT") or "8000").strip() or "8000")
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)

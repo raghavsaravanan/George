@@ -38,6 +38,7 @@ VECTOR_SIZE = 384
 DEFAULT_YEAR = "2019"
 DEFAULT_MAKE = "chevrolet"
 DEFAULT_MODEL = "silverado"
+DEFAULT_SHOP_ID = "shop_demo"
 
 # Longer / period-spaced patterns first so partial matches cannot corrupt text.
 _UNIT_EXPANSION_RULES: Sequence[tuple[re.Pattern[str], str]] = (
@@ -91,6 +92,7 @@ class VehicleMetadata:
     make: str
     model: str
     document_ref: str
+    shop_id: str = DEFAULT_SHOP_ID
 
     def normalized(self) -> "VehicleMetadata":
         return VehicleMetadata(
@@ -98,6 +100,7 @@ class VehicleMetadata:
             make=self.make.strip().lower(),
             model=self.model.strip().lower(),
             document_ref=self.document_ref.strip().lower(),
+            shop_id=self.shop_id.strip().lower() or DEFAULT_SHOP_ID,
         )
 
 
@@ -518,6 +521,7 @@ def build_points(
                     "model": meta.model,
                     "document_ref": meta.document_ref,
                     "section": chunk.section,
+                    "shop_id": meta.shop_id,
                 },
             )
         )
@@ -526,7 +530,7 @@ def build_points(
 
 def ensure_payload_indexes(client: QdrantClient) -> None:
     """Create keyword indexes required by Qdrant Cloud for filtered queries."""
-    for field_name in ("document_ref", "year", "make", "model"):
+    for field_name in ("document_ref", "year", "make", "model", "shop_id"):
         try:
             client.create_payload_index(
                 collection_name=COLLECTION_NAME,
@@ -552,10 +556,15 @@ def ensure_collection(client: QdrantClient) -> None:
     ensure_payload_indexes(client)
 
 
-def delete_points_for_document(client: QdrantClient, document_ref: str) -> None:
-    """Remove prior points for one manual so re-ingest is idempotent."""
+def delete_points_for_document(
+    client: QdrantClient,
+    document_ref: str,
+    shop_id: str,
+) -> None:
+    """Remove prior points for one manual + shop so re-ingest is tenant-safe."""
     if not client.collection_exists(COLLECTION_NAME):
         return
+    tenant = (shop_id or DEFAULT_SHOP_ID).strip().lower() or DEFAULT_SHOP_ID
     client.delete(
         collection_name=COLLECTION_NAME,
         points_selector=qmodels.FilterSelector(
@@ -564,7 +573,11 @@ def delete_points_for_document(client: QdrantClient, document_ref: str) -> None:
                     qmodels.FieldCondition(
                         key="document_ref",
                         match=qmodels.MatchValue(value=document_ref.strip().lower()),
-                    )
+                    ),
+                    qmodels.FieldCondition(
+                        key="shop_id",
+                        match=qmodels.MatchValue(value=tenant),
+                    ),
                 ]
             )
         ),
@@ -574,6 +587,7 @@ def delete_points_for_document(client: QdrantClient, document_ref: str) -> None:
 def seed_qdrant(
     points: Sequence[qmodels.PointStruct],
     document_ref: str,
+    shop_id: str,
 ) -> str:
     """Append/replace one document's points without wiping other manuals.
 
@@ -582,7 +596,7 @@ def seed_qdrant(
     client, location = open_qdrant_client()
     try:
         ensure_collection(client)
-        delete_points_for_document(client, document_ref)
+        delete_points_for_document(client, document_ref, shop_id)
         if points:
             client.upsert(collection_name=COLLECTION_NAME, points=list(points))
     finally:
@@ -597,6 +611,7 @@ async def run_ingest(
     model: str,
     embedding_model: TextEmbedding | None = None,
     *,
+    shop_id: str = DEFAULT_SHOP_ID,
     force_parse: bool = False,
     premium_mode: bool = False,
 ) -> int:
@@ -620,11 +635,13 @@ async def run_ingest(
             f"LlamaParse output for {pdf_path.name}. Refuse to seed empty points."
         )
 
+    tenant = (shop_id or DEFAULT_SHOP_ID).strip().lower() or DEFAULT_SHOP_ID
     metadata = VehicleMetadata(
         year=year,
         make=make,
         model=model,
         document_ref=document_ref_from_path(pdf_path),
+        shop_id=tenant,
     )
 
     print(f"Embedding {len(chunks)} chunk(s) with FastEmbed ({EMBEDDING_MODEL_NAME})...")
@@ -633,12 +650,19 @@ async def run_ingest(
 
     print(
         f"Upserting {len(points)} point(s) for document_ref="
-        f"{metadata.document_ref!r} into {COLLECTION_NAME}..."
+        f"{metadata.document_ref!r} shop_id={tenant!r} into {COLLECTION_NAME}..."
     )
-    location = seed_qdrant(points, document_ref=metadata.document_ref)
+    location = seed_qdrant(
+        points,
+        document_ref=metadata.document_ref,
+        shop_id=tenant,
+    )
 
     print(f"Seeded {len(points)} point(s) at {location}.")
-    print(f"Metadata: year={metadata.year} make={metadata.make} model={metadata.model}")
+    print(
+        f"Metadata: year={metadata.year} make={metadata.make} "
+        f"model={metadata.model} shop_id={tenant}"
+    )
     print(f"document_ref={metadata.document_ref}")
     for i, chunk in enumerate(chunks, start=1):
         preview = chunk.text.replace("\n", " | ")
@@ -656,6 +680,7 @@ async def run_ingest_many(
     make: str,
     model: str,
     *,
+    shop_id: str = DEFAULT_SHOP_ID,
     force_parse: bool = False,
     premium_mode: bool = False,
 ) -> int:
@@ -673,6 +698,7 @@ async def run_ingest_many(
             make=make,
             model=model,
             embedding_model=embedding_model,
+            shop_id=shop_id,
             force_parse=force_parse,
             premium_mode=premium_mode,
         )
@@ -683,8 +709,8 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Ingest one or more binary PDFs via LlamaParse into George's "
-            "local Qdrant store. Each document is replaced by document_ref; "
-            "other manuals in the collection are preserved. "
+            "Qdrant store (cloud or local). Each document is replaced by "
+            "document_ref within a shop_id tenant; other manuals are preserved. "
             "Parse results are cached under .george_parse_cache/ to avoid "
             "burning LlamaParse credits on every run."
         )
@@ -701,6 +727,11 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--year", default=DEFAULT_YEAR, help="Vehicle year metadata")
     parser.add_argument("--make", default=DEFAULT_MAKE, help="Vehicle make metadata")
     parser.add_argument("--model", default=DEFAULT_MODEL, help="Vehicle model metadata")
+    parser.add_argument(
+        "--shop-id",
+        default=DEFAULT_SHOP_ID,
+        help=f"Tenant shop id for payload isolation (default: {DEFAULT_SHOP_ID})",
+    )
     parser.add_argument(
         "--force-parse",
         action="store_true",
@@ -736,6 +767,7 @@ def main(argv: Iterable[str] | None = None) -> None:
                 year=args.year,
                 make=args.make,
                 model=args.model,
+                shop_id=args.shop_id,
                 force_parse=args.force_parse,
                 premium_mode=args.premium,
             )
