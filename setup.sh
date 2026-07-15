@@ -1,14 +1,39 @@
 #!/usr/bin/env bash
-# Validate local George prerequisites for demo/dev.
+# Validate George prerequisites for cloud-first demos.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DB_PATH="${ROOT}/george_mvp_db"
+cd "${ROOT}"
 
+if [[ -f .env ]]; then
+  # shellcheck disable=SC1091
+  set -a
+  # shellcheck disable=SC1090
+  source .env
+  set +a
+fi
+
+QDRANT_URL="${QDRANT_URL:-}"
+QDRANT_API_KEY="${QDRANT_API_KEY:-}"
+
+# Trim accidental spaces around values from KEY = value style .env files
+QDRANT_URL="$(echo "${QDRANT_URL}" | xargs)"
+QDRANT_API_KEY="$(echo "${QDRANT_API_KEY}" | xargs)"
+
+if [[ -n "${QDRANT_URL}" && -n "${QDRANT_API_KEY}" ]]; then
+  echo "Cloud Qdrant configured: ${QDRANT_URL}"
+  echo "Runtime DB is Qdrant Cloud. Local george_mvp_db/ is optional."
+  echo "Empty wipe:  .venv/bin/python purge_db.py"
+  echo "Re-seed:     .venv/bin/python ingest.py <pdf> --shop-id shop_demo ..."
+  exit 0
+fi
+
+DB_PATH="${ROOT}/george_mvp_db"
 if [[ ! -d "${DB_PATH}" ]]; then
   echo "Database missing. Run \`python ingest.py\` first."
+  echo "(Or set QDRANT_URL + QDRANT_API_KEY in .env for cloud.)"
   exit 1
 fi
 
-echo "george_mvp_db found at ${DB_PATH}"
+echo "Local george_mvp_db found at ${DB_PATH}"
 exit 0

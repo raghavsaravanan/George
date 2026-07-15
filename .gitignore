@@ -8,10 +8,14 @@ __pycache__/
 .ruff_cache/
 george_mvp_db/
 .george_parse_cache/
+.fastembed_cache/
 _ams_*.md
 _llama_parse_preview*.md
-.fastembed_cache/
 *.egg-info/
 dist/
 build/
 .DS_Store
+
+# Manuals stay on disk for local ingest; not in git (use cloud Qdrant for runtime).
+*.pdf
+*.PDF

@@ -4,22 +4,22 @@ Hands-free voice RAG for automotive technicians. Ask torque and install specs ou
 
 ```text
 ┌─────────────┐     ┌──────────────┐     ┌─────────────────┐
-│ Manual PDFs │ ──► │  ingest.py   │ ──► │ george_mvp_db   │
-│ (offline)   │     │ LlamaParse + │     │ Qdrant vectors  │
-└─────────────┘     │ FastEmbed    │     │ year/make/model │
+│ Manual PDFs │ ──► │  ingest.py   │ ──► │ Qdrant Cloud    │
+│ (local only)│     │ LlamaParse + │     │ george_specs    │
+└─────────────┘     │ FastEmbed    │     │ + shop_id       │
                     └──────────────┘     └────────┬────────┘
                                                   │
-Mechanic ──► Vapi ──► ngrok ──► main.py /vapi-tool ◄┘
-                         │              FastEmbed search
-                         └──────── spoken 1–2 sentences ──► headset
+Mechanic ──► Vapi ──► Render main.py /vapi-tool ◄─┘
+                         FastEmbed search
+                         spoken 1–2 sentences ──► headset
 ```
 
 ## Why two Python files?
 
 | File | Role | When it runs |
 | --- | --- | --- |
-| `ingest.py` | Offline seeder | You add/update PDFs |
-| `main.py` | Live Vapi webhook | Every Call / tool hit |
+| `ingest.py` | Offline seeder | You add/update PDFs (laptop / CI) |
+| `main.py` | Live Vapi webhook | Every Call / tool hit (Render) |
 
 Decoupled on purpose: eating manuals is slow and credit-sensitive; answering must stay sub-second.
 
@@ -27,16 +27,23 @@ Decoupled on purpose: eating manuals is slow and credit-sensitive; answering mus
 
 ```text
 George/
-├── ingest.py                 # PDF → chunks → Qdrant
-├── main.py                   # FastAPI POST /vapi-tool
+├── main.py              # FastAPI /vapi-tool + /health (Render)
+├── ingest.py            # PDF → chunks → Qdrant Cloud
+├── purge_db.py          # Wipe/recreate empty george_specs
+├── setup.sh             # Quick prerequisite check
 ├── requirements.txt
-├── DEMO.md                   # Shop-demo runbook
-├── intake_manifold_guide.pdf.pdf
-├── AMS Performance VR30 Guide.pdf
-├── .env                      # LLAMA_CLOUD_API_KEY (gitignored)
-├── george_mvp_db/            # Local Qdrant (gitignored)
-└── .george_parse_cache/      # Parsed Markdown cache (gitignored)
+├── Procfile             # Render start command
+├── render.yaml          # Render Blueprint
+├── runtime.txt          # Python 3.12
+├── DEMO.md              # Shop-demo runbook
+├── tests/               # Unit tests (formatters / normalizer)
+├── .env.example         # Env template (no secrets)
+├── *.pdf                # Local manuals only (gitignored)
+├── george_mvp_db/       # Optional local Qdrant (gitignored)
+└── .george_parse_cache/ # Parse cache (gitignored)
 ```
+
+**Note:** PDF manuals are kept on disk for ingest but are **not** tracked in git. Runtime answers come from Qdrant Cloud.
 
 ## Phase 1 — Ingest (build the brain)
 
