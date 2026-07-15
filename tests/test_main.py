@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 from main import (
+    ShopVehicleCatalog,
+    _infer_vehicle_fields,
+    _vehicle_fields_in_catalog,
     format_number_for_speech,
     format_voice_answer,
     query_normalizer,
@@ -14,6 +17,18 @@ _CAUTION_CHUNK = """| Application | Torque | Notes |
 | Intake Bolts | 15-18 foot-pounds | |
 Caution: Serious damage can occur when ignition is not installed correctly.
 """
+
+_DEMO_CATALOG = ShopVehicleCatalog(
+    makes=frozenset({"chevrolet", "nissan"}),
+    models=frozenset({"silverado", "vr30"}),
+    years=frozenset({"2019", "2016"}),
+    triples=frozenset(
+        {
+            ("2019", "chevrolet", "silverado"),
+            ("2016", "nissan", "vr30"),
+        }
+    ),
+)
 
 
 def test_part_number_226_020_speech_spaced() -> None:
@@ -48,3 +63,37 @@ def test_format_voice_answer_includes_caution_when_asked() -> None:
     )
     assert "15-18 foot-pounds" in spoken
     assert "ignition" in spoken.lower() or "caution" in spoken.lower()
+
+
+def test_infer_from_uploaded_catalog_only() -> None:
+    make, model, year = _infer_vehicle_fields(
+        "lower intake AMS VR30", "", "", "", _DEMO_CATALOG
+    )
+    assert make == "nissan"
+    assert model == "vr30"
+    assert year == "2016"
+
+    make, model, year = _infer_vehicle_fields(
+        "2019 Silverado intake bolts", "", "", "", _DEMO_CATALOG
+    )
+    assert make == "chevrolet"
+    assert model == "silverado"
+    assert year == "2019"
+
+    # Unknown platforms must not invent Chevy/Nissan tags.
+    make, model, year = _infer_vehicle_fields(
+        "Ford F-150 specs", "", "", "", _DEMO_CATALOG
+    )
+    assert make == ""
+    assert model == ""
+    assert year == ""
+
+
+def test_vehicle_fields_must_exist_in_catalog() -> None:
+    assert _vehicle_fields_in_catalog(
+        _DEMO_CATALOG, "2019", "chevrolet", "silverado"
+    )
+    assert not _vehicle_fields_in_catalog(_DEMO_CATALOG, "", "ford", "f150")
+    assert not _vehicle_fields_in_catalog(
+        _DEMO_CATALOG, "2019", "ford", "silverado"
+    )

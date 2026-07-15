@@ -35,9 +35,17 @@ QDRANT_PATH = PROJECT_ROOT / "george_mvp_db"
 COLLECTION_NAME = "george_specs"
 EMBEDDING_MODEL_NAME = "BAAI/bge-small-en-v1.5"
 DEFAULT_SHOP_ID = "shop_demo"
+# Cosine similarity floor for shop-scoped semantic fallback (Pass 3).
+# Tuned so in-corpus AMS/Chevy hits (~0.71–0.75) pass and unrelated
+# vehicles (Ford/Honda ~0.63–0.66) refuse → SPEC_NOT_FOUND.
+MIN_SEMANTIC_SCORE = 0.68
+# Soft vehicle match (Pass 2) may score a bit lower; still refuse junk.
+MIN_FILTERED_SCORE = 0.60
 
 # In-memory vehicle context keyed by Vapi callId (single-process demo/prod hop).
 _CALL_SESSIONS: dict[str, "CallSession"] = {}
+# shop_id → makes/models/years discovered from uploaded Qdrant payloads.
+_SHOP_CATALOGS: dict[str, "ShopVehicleCatalog"] = {}
 
 _DIGIT_GAP_RE = re.compile(r"(?<=\d)[.\s]+(?=\d)")
 # Dotted part-number groups like "226.020" / "12.13" (not single-digit decimals).
@@ -148,6 +156,102 @@ class CallSession:
     make: str = ""
     model: str = ""
     year: str = ""
+
+
+@dataclass(frozen=True)
+class ShopVehicleCatalog:
+    """Vehicles present in a shop's uploaded Qdrant corpus (the living brain)."""
+
+    makes: frozenset[str]
+    models: frozenset[str]
+    years: frozenset[str]
+    # (year, make, model) triples as stored on points
+    triples: frozenset[tuple[str, str, str]]
+
+    @property
+    def is_empty(self) -> bool:
+        return not self.triples and not self.makes and not self.models
+
+
+def get_shop_vehicle_catalog(
+    client: QdrantClient,
+    shop_id: str,
+    *,
+    force_refresh: bool = False,
+) -> ShopVehicleCatalog:
+    """Build (and cache) make/model/year sets from Qdrant payloads for one shop."""
+    tenant = (shop_id or DEFAULT_SHOP_ID).strip().lower() or DEFAULT_SHOP_ID
+    if not force_refresh and tenant in _SHOP_CATALOGS:
+        return _SHOP_CATALOGS[tenant]
+
+    makes: set[str] = set()
+    models: set[str] = set()
+    years: set[str] = set()
+    triples: set[tuple[str, str, str]] = set()
+
+    shop_filter = qmodels.Filter(
+        must=[
+            qmodels.FieldCondition(
+                key="shop_id",
+                match=qmodels.MatchValue(value=tenant),
+            )
+        ]
+    )
+    offset = None
+    while True:
+        points, offset = client.scroll(
+            collection_name=COLLECTION_NAME,
+            scroll_filter=shop_filter,
+            limit=128,
+            offset=offset,
+            with_payload=True,
+            with_vectors=False,
+        )
+        for point in points:
+            payload = getattr(point, "payload", None) or {}
+            if not isinstance(payload, dict):
+                continue
+            year = str(payload.get("year") or "").strip().lower()
+            make = str(payload.get("make") or "").strip().lower()
+            model = str(payload.get("model") or "").strip().lower()
+            if make:
+                makes.add(make)
+            if model:
+                models.add(model)
+            if year:
+                years.add(year)
+            if make or model or year:
+                triples.add((year, make, model))
+        if offset is None:
+            break
+
+    catalog = ShopVehicleCatalog(
+        makes=frozenset(makes),
+        models=frozenset(models),
+        years=frozenset(years),
+        triples=frozenset(triples),
+    )
+    _SHOP_CATALOGS[tenant] = catalog
+    logger.info(
+        "shop catalog ready shop_id=%r makes=%s models=%s years=%s triples=%d",
+        tenant,
+        sorted(makes),
+        sorted(models),
+        sorted(years),
+        len(triples),
+    )
+    return catalog
+
+
+def invalidate_shop_catalog(shop_id: str | None = None) -> None:
+    """Drop cached catalog(s) after a re-ingest so the brain refreshes."""
+    if shop_id:
+        _SHOP_CATALOGS.pop(
+            (shop_id or DEFAULT_SHOP_ID).strip().lower() or DEFAULT_SHOP_ID,
+            None,
+        )
+    else:
+        _SHOP_CATALOGS.clear()
 
 
 def query_normalizer(query: str) -> str:
@@ -559,6 +663,97 @@ def _payload_text(hit: Any) -> str | None:
     return text
 
 
+def _hit_score(hit: Any) -> float | None:
+    score = getattr(hit, "score", None)
+    if score is None:
+        return None
+    try:
+        return float(score)
+    except (TypeError, ValueError):
+        return None
+
+
+def _vehicle_fields_in_catalog(
+    catalog: ShopVehicleCatalog,
+    year: str,
+    make: str,
+    model: str,
+) -> bool:
+    """False when requested make/model/year is not present in uploaded shop data."""
+    if catalog.is_empty:
+        return False
+    if make and make not in catalog.makes:
+        return False
+    if model and model not in catalog.models:
+        return False
+    if year and year not in catalog.years:
+        return False
+    if make and model:
+        if not any(t[1] == make and t[2] == model for t in catalog.triples):
+            return False
+    return True
+
+
+def _payload_vehicle_matches(
+    hit: Any,
+    year: str,
+    make: str,
+    model: str,
+) -> bool:
+    """Reject hits whose payload vehicle tags contradict explicit request fields."""
+    payload = getattr(hit, "payload", None) or {}
+    if not isinstance(payload, dict):
+        return False
+    if make:
+        hit_make = str(payload.get("make") or "").strip().lower()
+        if hit_make and hit_make != make:
+            return False
+    if model:
+        hit_model = str(payload.get("model") or "").strip().lower()
+        if hit_model and hit_model != model:
+            return False
+    if year:
+        hit_year = str(payload.get("year") or "").strip().lower()
+        if hit_year and hit_year != year:
+            return False
+    return True
+
+
+def _accept_hit(
+    hit: Any,
+    *,
+    min_score: float | None,
+    year: str,
+    make: str,
+    model: str,
+    pass_name: str,
+) -> str | None:
+    text = _payload_text(hit)
+    if not text:
+        return None
+    if not _payload_vehicle_matches(hit, year, make, model):
+        logger.info(
+            "reject %s: vehicle payload mismatch year=%r make=%r model=%r",
+            pass_name,
+            year or None,
+            make or None,
+            model or None,
+        )
+        return None
+    if min_score is not None:
+        score = _hit_score(hit)
+        if score is None or score < min_score:
+            logger.info(
+                "reject %s: score=%s below min=%.3f",
+                pass_name,
+                score,
+                min_score,
+            )
+            return None
+        logger.info("accept %s: score=%.4f", pass_name, score)
+    return text
+
+
 def _query_vector_for(
     embedder: TextEmbedding,
     query: str,
@@ -617,11 +812,27 @@ def _search_top_chunk_sync(
     """Hybrid retrieval: exact metadata first, then soft match, then semantic.
 
     ``shop_id`` is a mandatory must-filter on every pass so tenants cannot
-    retrieve each other's manuals. Sync — call via ``search_top_chunk`` so
-    FastAPI never blocks the event loop.
+    retrieve each other's manuals. Pass 3 (and soft Pass 2) refuse low-score
+    nearest neighbors so unknown vehicles do not inherit AMS/Chevy leftovers.
+    Sync — call via ``search_top_chunk`` so FastAPI never blocks the event loop.
     """
     tenant = (shop_id or DEFAULT_SHOP_ID).strip().lower() or DEFAULT_SHOP_ID
     shop_must = [_shop_id_condition(tenant)]
+    catalog = get_shop_vehicle_catalog(client, tenant)
+
+    # Explicit vehicle fields must exist in this shop's uploaded brain.
+    if (make or model or year) and not _vehicle_fields_in_catalog(
+        catalog, year, make, model
+    ):
+        logger.info(
+            "refuse search: fields not in shop catalog shop_id=%r "
+            "year=%r make=%r model=%r",
+            tenant,
+            year or None,
+            make or None,
+            model or None,
+        )
+        return None
 
     query_vector = _query_vector_for(embedder, query, year, make, model)
     if query_vector is None:
@@ -647,9 +858,18 @@ def _search_top_chunk_sync(
             ]
         )
         hits = _search_points(client, query_vector, strict_filter, limit=1)
-        text = _payload_text(hits[0]) if hits else None
-        if text:
-            return text
+        if hits:
+            # Strict metadata already scoped the vehicle; score floor is not required.
+            text = _accept_hit(
+                hits[0],
+                min_score=None,
+                year=year,
+                make=make,
+                model=model,
+                pass_name="strict",
+            )
+            if text:
+                return text
 
     # Pass 2 — soft OR on vehicle fields, still locked to shop_id.
     soft_should: list[qmodels.FieldCondition] = []
@@ -683,16 +903,31 @@ def _search_top_chunk_sync(
             ),
         )
         hits = _search_points(client, query_vector, soft_filter, limit=1)
-        text = _payload_text(hits[0]) if hits else None
-        if text:
-            return text
+        if hits:
+            text = _accept_hit(
+                hits[0],
+                min_score=MIN_FILTERED_SCORE,
+                year=year,
+                make=make,
+                model=model,
+                pass_name="soft",
+            )
+            if text:
+                return text
 
     # Pass 3 — semantic fallback still restricted to this shop's corpus.
     tenant_filter = qmodels.Filter(must=shop_must)
     hits = _search_points(client, query_vector, query_filter=tenant_filter, limit=1)
     if not hits:
         return None
-    return _payload_text(hits[0])
+    return _accept_hit(
+        hits[0],
+        min_score=MIN_SEMANTIC_SCORE,
+        year=year,
+        make=make,
+        model=model,
+        pass_name="semantic",
+    )
 
 
 async def search_top_chunk(
@@ -904,12 +1139,14 @@ async def lifespan(app: FastAPI):
         )
 
     logger.info("Qdrant ready at %s collection=%s", collection_location, COLLECTION_NAME)
+    invalidate_shop_catalog()
     app.state.embedder = embedder
     app.state.qdrant = client
     try:
         yield
     finally:
         client.close()
+        invalidate_shop_catalog()
         logger.info("George webhook shut down")
 
 
@@ -931,29 +1168,61 @@ def _infer_vehicle_fields(
     make: str,
     model: str,
     year: str,
+    catalog: ShopVehicleCatalog | None = None,
 ) -> tuple[str, str, str]:
-    """Fill missing make/model/year from query keywords for known manuals."""
-    q = query.lower()
+    """Fill missing make/model/year only from tags present in the shop catalog."""
+    q = (query or "").lower()
     make_out, model_out, year_out = make, model, year
+    if catalog is None or catalog.is_empty:
+        return make_out, model_out, year_out
 
-    if any(token in q for token in ("vr30", "ams", "q50", "q60", "infiniti")):
-        if not make_out:
-            make_out = "nissan"
-        if not model_out:
-            model_out = "vr30"
-        if not year_out:
-            year_out = "2016"
+    if not model_out:
+        for candidate in sorted(catalog.models, key=len, reverse=True):
+            if candidate and candidate in q:
+                model_out = candidate
+                break
 
-    if "silverado" in q or ("chevy" in q) or ("chevrolet" in q):
-        if not make_out:
-            make_out = "chevrolet"
-        if not model_out and "silverado" in q:
-            model_out = "silverado"
-        if not year_out and "2019" in q:
-            year_out = "2019"
-        # Default Chevy demo vehicle when Silverado is named without a year.
-        if not year_out and model_out == "silverado":
-            year_out = "2019"
+    if not make_out:
+        for candidate in sorted(catalog.makes, key=len, reverse=True):
+            if candidate and candidate in q:
+                make_out = candidate
+                break
+
+    # Spelling aliases — only if the canonical tag exists in this shop's brain.
+    if not make_out and "chevy" in q and "chevrolet" in catalog.makes:
+        make_out = "chevrolet"
+    if not model_out and "ams" in q and "vr30" in catalog.models:
+        model_out = "vr30"
+    if not make_out and model_out == "vr30" and "nissan" in catalog.makes:
+        make_out = "nissan"
+
+    if not year_out:
+        for candidate in sorted(catalog.years, key=len, reverse=True):
+            if candidate and candidate in q:
+                year_out = candidate
+                break
+
+    # If model is known, fill make/year from the only matching uploaded triple(s).
+    if model_out:
+        matches = [t for t in catalog.triples if t[2] == model_out]
+        if matches:
+            if not make_out:
+                makes = {t[1] for t in matches if t[1]}
+                if len(makes) == 1:
+                    make_out = next(iter(makes))
+            if not year_out:
+                years = {t[0] for t in matches if t[0]}
+                if len(years) == 1:
+                    year_out = next(iter(years))
+
+    if make_out and not model_out:
+        matches = [t for t in catalog.triples if t[1] == make_out]
+        if len(matches) == 1:
+            y, _m, mo = matches[0]
+            if mo and not model_out:
+                model_out = mo
+            if y and not year_out:
+                year_out = y
 
     return make_out, model_out, year_out
 
@@ -1041,11 +1310,13 @@ async def vapi_tool(request: Request) -> JSONResponse:
                 year or None,
             )
 
-        make, model, year = _infer_vehicle_fields(query, make, model, year)
-        _update_session_vehicle_fields(call_id, make, model, year)
-
         client: QdrantClient = request.app.state.qdrant
         embedder: TextEmbedding = request.app.state.embedder
+        catalog = get_shop_vehicle_catalog(client, shop_id)
+        make, model, year = _infer_vehicle_fields(
+            query, make, model, year, catalog
+        )
+        _update_session_vehicle_fields(call_id, make, model, year)
 
         try:
             chunk_text = await search_top_chunk(
