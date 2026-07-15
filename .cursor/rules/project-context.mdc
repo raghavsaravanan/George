@@ -1,0 +1,70 @@
+---
+description: Comprehensive system architecture, operational constraints, free-tier tech stack, and data flow blueprint for Project George
+alwaysApply: true
+---
+
+# SYSTEM ARCHITECTURE SPECIFICATION: PROJECT GEORGE
+George is an autonomous, hands-free, low-latency voice-first AI assistant built specifically for automotive technicians. Technicians operate in environments characterized by high ambient acoustic noise (pneumatic tools, compressors) and physical barriers (grease-covered hands, tool manipulation) that preclude interaction with screens, keyboards, or mouse pads.
+
+---
+
+## 🎭 USER EXPERIENCE FLOW (POV)
+1. **Initiation**: The mechanic launches a minimalist interface on a web/mobile browser and selects their active service bay.
+2. **Connection**: The browser establishes a bidirectional WebRTC audio link. The interface displays a responsive, pulsating, Siri-style circular canvas indicating an active listener loop.
+3. **Query**: The technician, actively working under-hood, speaks naturally: *"George, what's the intake manifold torque spec for a 2019 Silverado?"*
+4. **Delivery**: Within 500-800ms, George suppresses background noise, interrupts the environment, and delivers a precise audio response directly to the technician's headset: *"The final pass specification is 106 inch-pounds. Follow a cross-tightening sequence."*
+
+---
+
+## 🛠️ THE INFRASTRUCTURE STACK (PRODUCTION-READY FREE TIERS)
+
+The architecture leverages maximum developer free tiers to eliminate financial overhead during R&D validation:
+
+*   **Ingestion Engine (LlamaIndex Cloud / LlamaParse)**: Allocated 1,000 free parsed pages per month. Used to run layout-aware agentic document analysis to turn messy technical manuals into structurally intact Markdown data tables.
+*   **Vector Database (Qdrant Client)**: Operating as a local, zero-cost, file-based database instance inside the project root directory (`./george_mvp_db`).
+*   **Local Embeddings (FastEmbed)**: Embedded directly into the Python pipeline to generate vector representations locally on CPU without making external API calls.
+*   **Voice Pipeline-as-a-Service (Vapi Platform)**: Handles real-time WebRTC orchestration, hardware noise cancelation, Deepgram Speech-to-Text transcription, and ElevenLabs Text-to-Speech synthesis out of the box using promotional developer credits.
+*   **LLM Core & Token Processing (OpenAI API / Google AI Studio)**: Powers the conversational reasoning engine behind the Vapi assistant profile and drives precision context analysis.
+*   **Public Tunneling Gateway (Ngrok)**: Exposes the local dev loop port securely to the public internet so Vapi can transmit webhooks to our local machine.
+
+---
+
+## ⛓️ ASYMMETRIC DATA CHOREOGRAPHY
+[ PHASE 1: ASYNCHRONOUS DATA INGESTION (OFFLINE) ]
+Unstructured FSM Manual (.txt/.pdf)
+└──> LlamaParse Engine (Enforces Markdown Table Layout)
+└──> Semantic Table Chunking
+└──> Local FastEmbed Generation (384-dim Vectors)
+└──> Local Qdrant Store (Injected with Year/Make/Model metadata tags)
+[ PHASE 2: SYNCHRONOUS CONVERSATIONAL RUNTIME (LIVE VOICE LOOP) ]
+Mechanic Voice ──> Vapi Pipeline (WebRTC + Audio Denoising)
+│
+▼ (Triggers Custom Function Hook HTTP POST JSON)
+Local FastAPI Server (main.py)
+│
+▼ (Executes Metadata-Filtered Hybrid-RAG Search)
+Qdrant Vector DB (Validates strict Year/Make/Model match)
+│
+▼ (Returns Clean String Layout: Spec + Warnings)
+Vapi Audio Out ──> Mechanic Headset (Sub-800ms Round Trip)
+
+---
+
+## 🎯 STRICT CO-ARCHITECT ENGAGEMENT & RUNTIME CONSTRAINTS
+
+When executing code modifications or structural planning, Cursor must rigorously enforce the following engineering constraints:
+
+1. **Decoupled Architecture**: Codebases must remain physically separate. `ingest.py` handles offline database structural seeding. `main.py` serves the live webhook API routes.
+2. **Data Structure Safety**: Technical text fragments must never clip tables across vector boundaries. Data configurations must cleanly isolate tables using strict Markdown syntax (`| column |`).
+3. **Verbal Conciseness Rule**: Text strings generated for Vapi tools must be structurally optimized for audio consumption. Limit strings to 1-2 direct sentences max. No conversational filler or long blocks of text.
+4. **Mechanical Unit Preservation Trap**: To prevent catastrophic mechanical failures (e.g., stripping aluminum cylinder threads), torque and liquid values must be explicitly spelled out in plain text (e.g., write out `"inch-pounds"` or `"foot-pounds"` completely; never return abbreviations like `"lb-in"` or `"lb-ft"`).
+5. **Zero Snippet Policy**: When building or altering Python assets, output the entire file content seamlessly. No empty implementations, code truncation, or `// TODO` placeholders.
+
+---
+
+## ⚡ AUTOMATED AGENT COMMAND SEQUENCE
+Follow this iterative prompt loop in Cursor Agent Mode (`Cmd+L` / `Ctrl+L` toggled to **Agent**) for every file construction step:
+
+1. **Plan Phase**: `"Read @project-context.mdc. I need to build [Target File Name]. Outline your complete execution strategy and file layout structure before writing code."`
+2. **Build Phase**: `"The layout is approved. Proceed to write out the full file contents for [Target File Name]. Do not truncate or use placeholders."`
+3. **Audit Phase**: `"Analyze [Target File Name] against our metadata filter isolation rules and the explicit unit safety requirements in @project-context.mdc. Refine code based on your internal check."`
