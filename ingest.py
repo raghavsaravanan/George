@@ -3,13 +3,15 @@
 Parses a binary FSM/service PDF via LlamaParse into Markdown, expands
 mechanical unit abbreviations for voice-safe storage, isolates Markdown
 tables as atomic chunks, embeds them locally with FastEmbed, and upserts
-into a file-based Qdrant collection at ./george_mvp_db.
+into Qdrant (cloud when QDRANT_URL + QDRANT_API_KEY are set, otherwise
+the local file-based store at ./george_mvp_db).
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import re
 import sys
 import uuid
@@ -24,6 +26,8 @@ from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
 
 PROJECT_ROOT = Path(__file__).resolve().parent
+load_dotenv(PROJECT_ROOT / ".env")
+
 DEFAULT_PDF_PATH = PROJECT_ROOT / "intake_manifold_guide.pdf.pdf"
 QDRANT_PATH = PROJECT_ROOT / "george_mvp_db"
 PARSE_CACHE_DIR = PROJECT_ROOT / ".george_parse_cache"
@@ -104,9 +108,6 @@ class SpecChunk:
 
 
 def load_api_key() -> str:
-    load_dotenv(PROJECT_ROOT / ".env")
-    import os
-
     raw = os.getenv("LLAMA_CLOUD_API_KEY")
     if raw is None:
         raise SystemExit(
@@ -119,6 +120,25 @@ def load_api_key() -> str:
             "Set a valid LlamaParse API key in .env."
         )
     return api_key
+
+
+def open_qdrant_client() -> tuple[QdrantClient, str]:
+    """Return a Qdrant client and a human-readable location label.
+
+    Prefer cloud when both ``QDRANT_URL`` and ``QDRANT_API_KEY`` are set;
+    otherwise use the local file-backed store at ``QDRANT_PATH``.
+    """
+    qdrant_url = (os.getenv("QDRANT_URL") or "").strip()
+    qdrant_api_key = (os.getenv("QDRANT_API_KEY") or "").strip()
+
+    if qdrant_url and qdrant_api_key:
+        return (
+            QdrantClient(url=qdrant_url, api_key=qdrant_api_key),
+            qdrant_url,
+        )
+
+    QDRANT_PATH.mkdir(parents=True, exist_ok=True)
+    return QdrantClient(path=str(QDRANT_PATH)), str(QDRANT_PATH)
 
 
 def expand_mechanical_units(text: str) -> str:
@@ -504,16 +524,32 @@ def build_points(
     return points
 
 
+def ensure_payload_indexes(client: QdrantClient) -> None:
+    """Create keyword indexes required by Qdrant Cloud for filtered queries."""
+    for field_name in ("document_ref", "year", "make", "model"):
+        try:
+            client.create_payload_index(
+                collection_name=COLLECTION_NAME,
+                field_name=field_name,
+                field_schema=qmodels.PayloadSchemaType.KEYWORD,
+            )
+        except Exception as exc:  # noqa: BLE001 - index may already exist
+            message = str(exc).lower()
+            if "already exists" in message or "duplicate" in message:
+                continue
+            raise
+
+
 def ensure_collection(client: QdrantClient) -> None:
-    if client.collection_exists(COLLECTION_NAME):
-        return
-    client.create_collection(
-        collection_name=COLLECTION_NAME,
-        vectors_config=qmodels.VectorParams(
-            size=VECTOR_SIZE,
-            distance=qmodels.Distance.COSINE,
-        ),
-    )
+    if not client.collection_exists(COLLECTION_NAME):
+        client.create_collection(
+            collection_name=COLLECTION_NAME,
+            vectors_config=qmodels.VectorParams(
+                size=VECTOR_SIZE,
+                distance=qmodels.Distance.COSINE,
+            ),
+        )
+    ensure_payload_indexes(client)
 
 
 def delete_points_for_document(client: QdrantClient, document_ref: str) -> None:
@@ -538,10 +574,12 @@ def delete_points_for_document(client: QdrantClient, document_ref: str) -> None:
 def seed_qdrant(
     points: Sequence[qmodels.PointStruct],
     document_ref: str,
-) -> None:
-    """Append/replace one document's points without wiping other manuals."""
-    QDRANT_PATH.mkdir(parents=True, exist_ok=True)
-    client = QdrantClient(path=str(QDRANT_PATH))
+) -> str:
+    """Append/replace one document's points without wiping other manuals.
+
+    Returns the Qdrant location label used for this upsert (URL or local path).
+    """
+    client, location = open_qdrant_client()
     try:
         ensure_collection(client)
         delete_points_for_document(client, document_ref)
@@ -549,6 +587,7 @@ def seed_qdrant(
             client.upsert(collection_name=COLLECTION_NAME, points=list(points))
     finally:
         client.close()
+    return location
 
 
 async def run_ingest(
@@ -594,11 +633,11 @@ async def run_ingest(
 
     print(
         f"Upserting {len(points)} point(s) for document_ref="
-        f"{metadata.document_ref!r} into {QDRANT_PATH} / {COLLECTION_NAME}..."
+        f"{metadata.document_ref!r} into {COLLECTION_NAME}..."
     )
-    seed_qdrant(points, document_ref=metadata.document_ref)
+    location = seed_qdrant(points, document_ref=metadata.document_ref)
 
-    print(f"Seeded {len(points)} point(s).")
+    print(f"Seeded {len(points)} point(s) at {location}.")
     print(f"Metadata: year={metadata.year} make={metadata.make} model={metadata.model}")
     print(f"document_ref={metadata.document_ref}")
     for i, chunk in enumerate(chunks, start=1):

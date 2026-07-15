@@ -8,13 +8,18 @@ and returns a single-line 1-2 sentence spoken result for headset TTS.
 
 from __future__ import annotations
 
+import asyncio
+import logging
+import os
 import re
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
 import uvicorn
+from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastembed import TextEmbedding
@@ -22,9 +27,50 @@ from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
 
 PROJECT_ROOT = Path(__file__).resolve().parent
+load_dotenv(PROJECT_ROOT / ".env")
+
+logger = logging.getLogger("george.main")
+
 QDRANT_PATH = PROJECT_ROOT / "george_mvp_db"
 COLLECTION_NAME = "george_specs"
 EMBEDDING_MODEL_NAME = "BAAI/bge-small-en-v1.5"
+
+# In-memory vehicle context keyed by Vapi callId (single-process demo/prod hop).
+_CALL_SESSIONS: dict[str, "CallSession"] = {}
+
+_DIGIT_GAP_RE = re.compile(r"(?<=\d)[.\s]+(?=\d)")
+# Dotted part-number groups like "226.020" / "12.13" (not single-digit decimals).
+_PART_NUMBER_DOT_RE = re.compile(r"(?<=\d{2})\.(?=\d{2})")
+# Contiguous digit runs for TTS digit-spelling (years excluded in helper).
+_PART_NUMBER_RUN_RE = re.compile(r"\d{4,}")
+_YEAR_LIKE_RE = re.compile(r"^(?:19|20|21)\d{2}$")
+_VEHICLE_TYPO_RULES: Sequence[tuple[re.Pattern[str], str]] = (
+    (re.compile(r"\bbr[\s\-]?30\b", re.IGNORECASE), "vr30"),
+    (re.compile(r"\bdr[\s\-]?30\b", re.IGNORECASE), "vr30"),
+    (re.compile(r"\bv[\s\.\-]*r[\s\.\-]*30\b", re.IGNORECASE), "vr30"),
+    (re.compile(r"\bfuel[\s\-]?pro\b", re.IGNORECASE), "fel-pro"),
+    (re.compile(r"\bfell[\s\-]?pro\b", re.IGNORECASE), "fel-pro"),
+    (re.compile(r"\bfelpro\b", re.IGNORECASE), "fel-pro"),
+    (re.compile(r"\bchevy\b", re.IGNORECASE), "chevrolet"),
+    (re.compile(r"\bsilverad[ao]\b", re.IGNORECASE), "silverado"),
+)
+
+_CAUTION_QUERY_HINTS = (
+    "warning",
+    "caution",
+    "safety",
+    "tips",
+    "tip",
+)
+_SEQUENCE_QUERY_HINTS = (
+    "sequence",
+    "pattern",
+    "cross pattern",
+    "cross-pattern",
+    "tightening order",
+    "torque sequence",
+    "bolt order",
+)
 
 _UNIT_EXPANSION_RULES: Sequence[tuple[re.Pattern[str], str]] = (
     (re.compile(r"\blb\.\s*ft\.", re.IGNORECASE), "foot-pounds"),
@@ -76,7 +122,7 @@ _QUERY_TORQUE_HINTS = (
 )
 
 
-@dataclass(frozen=True)
+@dataclass
 class SpokenAnswer:
     tool_call_id: str
     ok: bool
@@ -94,13 +140,142 @@ class SpokenAnswer:
         return payload
 
 
+@dataclass
+class CallSession:
+    """Per-call vehicle memory for hands-free follow-up questions."""
+
+    make: str = ""
+    model: str = ""
+    year: str = ""
+
+
+def query_normalizer(query: str) -> str:
+    """Repair STT digit gaps and common vehicle/brand mishears before search."""
+    text = (query or "").strip()
+    if not text:
+        return ""
+
+    # "20. 19" -> "2019", "226. 042" -> "226042"
+    text = _DIGIT_GAP_RE.sub("", text)
+
+    for pattern, replacement in _VEHICLE_TYPO_RULES:
+        text = pattern.sub(replacement, text)
+
+    return _MULTI_SPACE_RE.sub(" ", text).strip()
+
+
+def _extract_call_id(payload: dict[str, Any]) -> str:
+    for key in ("callId", "call_id"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+    call = payload.get("call")
+    if isinstance(call, dict):
+        for key in ("id", "callId", "call_id"):
+            value = call.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+    message = payload.get("message")
+    if isinstance(message, dict):
+        nested_call = message.get("call")
+        if isinstance(nested_call, dict):
+            for key in ("id", "callId", "call_id"):
+                value = nested_call.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+        for key in ("callId", "call_id"):
+            value = message.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+    return ""
+
+
+def _get_or_create_session(call_id: str) -> CallSession | None:
+    if not call_id:
+        return None
+    session = _CALL_SESSIONS.get(call_id)
+    if session is None:
+        session = CallSession()
+        _CALL_SESSIONS[call_id] = session
+    return session
+
+
+def _apply_session_vehicle_fields(
+    call_id: str,
+    make: str,
+    model: str,
+    year: str,
+) -> tuple[str, str, str]:
+    """Fill missing make/model/year from the in-memory call session."""
+    session = _get_or_create_session(call_id)
+    if session is None:
+        return make, model, year
+
+    make_out = make or session.make
+    model_out = model or session.model
+    year_out = year or session.year
+    return make_out, model_out, year_out
+
+
+def _update_session_vehicle_fields(
+    call_id: str,
+    make: str,
+    model: str,
+    year: str,
+) -> None:
+    session = _get_or_create_session(call_id)
+    if session is None:
+        return
+    if make:
+        session.make = make
+    if model:
+        session.model = model
+    if year:
+        session.year = year
+
+
+def _should_include_caution(query: str) -> bool:
+    lowered = (query or "").lower()
+    if any(hint in lowered for hint in _CAUTION_QUERY_HINTS):
+        return True
+    if any(hint in lowered for hint in _SEQUENCE_QUERY_HINTS):
+        return True
+    return False
+
+
 def to_single_line(text: str) -> str:
     cleaned = text.replace("\r\n", "\n").replace("\r", "\n")
     cleaned = cleaned.replace("\n", " ").replace("\t", " ")
     cleaned = _HTML_ENTITY_RE.sub(" ", cleaned)
     cleaned = _MARKDOWN_EMPHASIS_RE.sub("", cleaned)
+    # Collapse dotted part-number sequences: "226.020" -> "226020", "12.13" -> "1213".
+    # Requires 2+ digits on each side so values like "1.5" stay intact.
+    cleaned = _PART_NUMBER_DOT_RE.sub("", cleaned)
     cleaned = _MULTI_SPACE_RE.sub(" ", cleaned).strip()
     return cleaned
+
+
+def format_number_for_speech(text: str) -> str:
+    """Spell part-number digit runs individually for TTS clarity.
+
+    Sequences of 4+ digits (except years like 2019) become spaced digits so
+    "1213" is spoken as "1 2 1 3" rather than "one thousand two hundred thirteen".
+    """
+
+    def _replace_run(match: re.Match[str]) -> str:
+        digits = match.group(0)
+        if _YEAR_LIKE_RE.fullmatch(digits):
+            return digits
+        # Prefer explicit 4-5 digit part numbers; longer OEM application
+        # codes (e.g. 226042) are also digit-spelled for the same reason.
+        if len(digits) < 4:
+            return digits
+        return " ".join(digits)
+
+    return _PART_NUMBER_RUN_RE.sub(_replace_run, text or "")
 
 
 def expand_mechanical_units(text: str) -> str:
@@ -292,7 +467,7 @@ def format_voice_answer(chunk_text: str, query: str) -> str:
             for part in re.split(r"(?<=[.!?])\s+", fallback)
             if part.strip()
         ]
-        return to_single_line(" ".join(sentences[:2]))
+        return format_number_for_speech(to_single_line(" ".join(sentences[:2])))
 
     header = table_rows[0]
     body_rows = table_rows[1:] if len(table_rows) > 1 else []
@@ -354,7 +529,10 @@ def format_voice_answer(chunk_text: str, query: str) -> str:
                     primary = to_single_line(f"{primary} {second_fact}")
                     break
 
-    warning = _compose_warning_sentence(caution_text)
+    warning = ""
+    if _should_include_caution(query):
+        warning = _compose_warning_sentence(caution_text)
+
     if warning and warning.lower() not in primary.lower():
         combined = to_single_line(f"{primary} {warning}")
     else:
@@ -366,7 +544,8 @@ def format_voice_answer(chunk_text: str, query: str) -> str:
         if part.strip()
     ]
     clipped = " ".join(sentences[:2])
-    return to_single_line(expand_mechanical_units(clipped))
+    spoken = to_single_line(expand_mechanical_units(clipped))
+    return format_number_for_speech(spoken)
 
 
 def _payload_text(hit: Any) -> str | None:
@@ -417,7 +596,7 @@ def _search_points(
     return list(response.points)
 
 
-def search_top_chunk(
+def _search_top_chunk_sync(
     client: QdrantClient,
     embedder: TextEmbedding,
     query: str,
@@ -429,7 +608,8 @@ def search_top_chunk(
 
     Exact year/make/model matches are preferred when present in Qdrant, but
     mismatched or fuzzy vehicle strings still return the closest technical
-    chunk via unfiltered vector similarity.
+    chunk via unfiltered vector similarity. Sync — call via
+    ``search_top_chunk`` so FastAPI never blocks the event loop.
     """
     query_vector = _query_vector_for(embedder, query, year, make, model)
     if query_vector is None:
@@ -497,6 +677,26 @@ def search_top_chunk(
     if not hits:
         return None
     return _payload_text(hits[0])
+
+
+async def search_top_chunk(
+    client: QdrantClient,
+    embedder: TextEmbedding,
+    query: str,
+    year: str,
+    make: str,
+    model: str,
+) -> str | None:
+    """Run hybrid retrieval off the event loop (embed + Qdrant are sync)."""
+    return await asyncio.to_thread(
+        _search_top_chunk_sync,
+        client,
+        embedder,
+        query,
+        year,
+        make,
+        model,
+    )
 
 
 def _coerce_string(value: Any) -> str:
@@ -611,7 +811,7 @@ def handle_tool_call(
         )
 
     try:
-        chunk_text = search_top_chunk(
+        chunk_text = _search_top_chunk_sync(
             client=client,
             embedder=embedder,
             query=args["query"],
@@ -646,26 +846,45 @@ def handle_tool_call(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    if not QDRANT_PATH.exists():
-        raise RuntimeError(
-            f"Qdrant path does not exist: {QDRANT_PATH}. Run ingest.py first."
+    if not logging.getLogger().handlers:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
         )
+    logger.setLevel(logging.INFO)
+    logger.info("George webhook starting up")
 
     embedder = TextEmbedding(model_name=EMBEDDING_MODEL_NAME)
-    client = QdrantClient(path=str(QDRANT_PATH))
+
+    qdrant_url = (os.getenv("QDRANT_URL") or "").strip()
+    qdrant_api_key = (os.getenv("QDRANT_API_KEY") or "").strip()
+
+    if qdrant_url and qdrant_api_key:
+        client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key)
+        collection_location = qdrant_url
+    else:
+        if not QDRANT_PATH.exists():
+            raise RuntimeError(
+                f"Qdrant path does not exist: {QDRANT_PATH}. Run ingest.py first."
+            )
+        client = QdrantClient(path=str(QDRANT_PATH))
+        collection_location = str(QDRANT_PATH)
 
     if not client.collection_exists(COLLECTION_NAME):
         client.close()
         raise RuntimeError(
-            f"Qdrant collection '{COLLECTION_NAME}' was not found at {QDRANT_PATH}."
+            f"Qdrant collection '{COLLECTION_NAME}' was not found at "
+            f"{collection_location}."
         )
 
+    logger.info("Qdrant ready at %s collection=%s", collection_location, COLLECTION_NAME)
     app.state.embedder = embedder
     app.state.qdrant = client
     try:
         yield
     finally:
         client.close()
+        logger.info("George webhook shut down")
 
 
 app = FastAPI(
@@ -709,12 +928,25 @@ def _infer_vehicle_fields(
 
 @app.post("/vapi-tool")
 async def vapi_tool(request: Request) -> JSONResponse:
-    """Accept flat apiRequest body: {query, make, model, year}.
+    """Accept flat apiRequest body: {query, make, model, year, callId?}.
 
-    Only ``query`` is required. Missing vehicle fields are inferred from the
+    Only ``query`` is required. Missing vehicle fields are filled from the
+    in-memory call session when ``callId`` is present, then inferred from the
     query when possible so the voice agent does not need to interrogate the
     tech for year/make/model on every turn.
     """
+    started = time.perf_counter()
+    outcome = "error"
+
+    webhook_secret = (os.getenv("VAPI_WEBHOOK_SECRET") or "").strip()
+    if webhook_secret:
+        incoming_secret = request.headers.get("x-vapi-secret")
+        if incoming_secret != webhook_secret:
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Unauthorized"},
+            )
+
     try:
         payload = await request.json()
     except Exception:  # noqa: BLE001 - still return Vapi-shaped 200
@@ -747,6 +979,7 @@ async def vapi_tool(request: Request) -> JSONResponse:
     make = str(payload.get("make") or "").strip().lower()
     model = str(payload.get("model") or "").strip().lower()
     year = str(payload.get("year") or "").strip().lower()
+    call_id = _extract_call_id(payload)
 
     if not query:
         return JSONResponse(
@@ -761,76 +994,108 @@ async def vapi_tool(request: Request) -> JSONResponse:
             },
         )
 
-    make, model, year = _infer_vehicle_fields(query, make, model, year)
-
-    client: QdrantClient = request.app.state.qdrant
-    embedder: TextEmbedding = request.app.state.embedder
-
     try:
-        chunk_text = search_top_chunk(
-            client=client,
-            embedder=embedder,
-            query=query,
-            year=year,
-            make=make,
-            model=model,
-        )
-    except Exception as exc:  # noqa: BLE001 - surface as tool error string
-        return JSONResponse(
-            status_code=200,
-            content={
-                "results": [
-                    {
-                        "toolCallId": "vapi-call",
-                        "error": f"Specification lookup failed: {exc}.",
-                    }
-                ]
-            },
-        )
+        query = query_normalizer(query)
+        make, model, year = _apply_session_vehicle_fields(call_id, make, model, year)
 
-    if chunk_text is None:
+        if not make or not model or not year:
+            logger.warning(
+                "context-less lookup call_id=%r query=%r make=%r model=%r year=%r",
+                call_id or None,
+                query,
+                make or None,
+                model or None,
+                year or None,
+            )
+
+        make, model, year = _infer_vehicle_fields(query, make, model, year)
+        _update_session_vehicle_fields(call_id, make, model, year)
+
+        client: QdrantClient = request.app.state.qdrant
+        embedder: TextEmbedding = request.app.state.embedder
+
+        try:
+            chunk_text = await search_top_chunk(
+                client=client,
+                embedder=embedder,
+                query=query,
+                year=year,
+                make=make,
+                model=model,
+            )
+        except Exception as exc:  # noqa: BLE001 - surface as tool error string
+            outcome = "lookup_failed"
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "results": [
+                        {
+                            "toolCallId": "vapi-call",
+                            "error": f"Specification lookup failed: {exc}.",
+                        }
+                    ]
+                },
+            )
+
+        if chunk_text is None:
+            outcome = "not_found"
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "results": [
+                        {
+                            "toolCallId": "vapi-call",
+                            "error": (
+                                "No specification found for that year make and model."
+                            ),
+                        }
+                    ]
+                },
+            )
+
+        spoken_result = format_voice_answer(chunk_text, query)
+        if not spoken_result:
+            outcome = "format_failed"
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "results": [
+                        {
+                            "toolCallId": "vapi-call",
+                            "error": (
+                                "Specification found but could not be formatted "
+                                "for speech."
+                            ),
+                        }
+                    ]
+                },
+            )
+
+        outcome = "ok"
         return JSONResponse(
             status_code=200,
             content={
                 "results": [
                     {
                         "toolCallId": "vapi-call",
-                        "error": (
-                            "No specification found for that year make and model."
+                        "result": format_number_for_speech(
+                            to_single_line(spoken_result)
                         ),
                     }
                 ]
             },
         )
-
-    spoken_result = format_voice_answer(chunk_text, query)
-    if not spoken_result:
-        return JSONResponse(
-            status_code=200,
-            content={
-                "results": [
-                    {
-                        "toolCallId": "vapi-call",
-                        "error": (
-                            "Specification found but could not be formatted "
-                            "for speech."
-                        ),
-                    }
-                ]
-            },
+    finally:
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        logger.info(
+            "vapi_tool outcome=%s elapsed_ms=%.1f query=%r year=%r make=%r model=%r",
+            outcome,
+            elapsed_ms,
+            query,
+            year or None,
+            make or None,
+            model or None,
         )
-
-    return JSONResponse(
-        status_code=200,
-        content={
-            "results": [
-                {
-                    "toolCallId": "vapi-call",
-                    "result": to_single_line(spoken_result),
-                }
-            ]
-        },
-    )
 
 
 if __name__ == "__main__":
