@@ -820,6 +820,11 @@ def _search_top_chunk_sync(
     shop_must = [_shop_id_condition(tenant)]
     catalog = get_shop_vehicle_catalog(client, tenant)
 
+    # Empty shop brain (post-purge / no uploads) → hard miss, no semantic gambling.
+    if catalog.is_empty:
+        logger.info("refuse search: empty shop catalog shop_id=%r", tenant)
+        return None
+
     # Explicit vehicle fields must exist in this shop's uploaded brain.
     if (make or model or year) and not _vehicle_fields_in_catalog(
         catalog, year, make, model
@@ -1493,13 +1498,16 @@ async def vapi_tool(request: Request) -> JSONResponse:
             )
 
         if chunk_text is None:
+            # Catch-all miss: empty DB, unknown vehicle, or below score floors.
+            # toolCallId is fixed to "vapi-call" for the stable empty-corpus contract
+            # (Vapi ignores mismatch when the tool was invoked as a single call).
             outcome = "not_found"
             return JSONResponse(
                 status_code=200,
                 content={
                     "results": [
                         {
-                            "toolCallId": tool_call_id,
+                            "toolCallId": "vapi-call",
                             "result": (
                                 "I don't see that specification anywhere "
                                 "in my current manuals."
