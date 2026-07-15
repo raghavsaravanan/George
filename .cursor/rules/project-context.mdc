@@ -1,8 +1,6 @@
 ---
-description: Comprehensive system architecture, operational constraints, free-tier tech stack, and data flow blueprint for Project George
 alwaysApply: true
 ---
-
 # SYSTEM ARCHITECTURE SPECIFICATION: PROJECT GEORGE
 George is an autonomous, hands-free, low-latency voice-first AI assistant built specifically for automotive technicians. Technicians operate in environments characterized by high ambient acoustic noise (pneumatic tools, compressors) and physical barriers (grease-covered hands, tool manipulation) that preclude interaction with screens, keyboards, or mouse pads.
 
