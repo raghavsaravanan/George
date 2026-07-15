@@ -1079,8 +1079,9 @@ async def vapi_tool(request: Request) -> JSONResponse:
                     "results": [
                         {
                             "toolCallId": "vapi-call",
-                            "error": (
-                                "No specification found for that year make and model."
+                            "result": (
+                                "ERROR: SPEC_NOT_FOUND. I do not have that "
+                                "spec in the manuals."
                             ),
                         }
                     ]
