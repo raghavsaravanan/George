@@ -7,6 +7,9 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 george_mvp_db/
+.george_parse_cache/
+_ams_*.md
+_llama_parse_preview*.md
 .fastembed_cache/
 *.egg-info/
 dist/

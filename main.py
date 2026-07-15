@@ -33,12 +33,15 @@ _UNIT_EXPANSION_RULES: Sequence[tuple[re.Pattern[str], str]] = (
     (re.compile(r"\blb\s*-\s*ft\.?\b", re.IGNORECASE), "foot-pounds"),
     (re.compile(r"\bft\.\s*lb\.?", re.IGNORECASE), "foot-pounds"),
     (re.compile(r"\bft\s*-\s*lb\.?\b", re.IGNORECASE), "foot-pounds"),
+    (re.compile(r"\bft\s+lbs?\b", re.IGNORECASE), "foot-pounds"),
+    (re.compile(r"(?<=\d)ft\s*lbs?\b", re.IGNORECASE), " foot-pounds"),
     (re.compile(r"\blb\.\s*in\.", re.IGNORECASE), "inch-pounds"),
     (re.compile(r"\blb\.\s*in\b", re.IGNORECASE), "inch-pounds"),
     (re.compile(r"\blb\.\-in\.?", re.IGNORECASE), "inch-pounds"),
     (re.compile(r"\blb\s*-\s*in\.?\b", re.IGNORECASE), "inch-pounds"),
     (re.compile(r"\bin\.\s*lb\.?", re.IGNORECASE), "inch-pounds"),
     (re.compile(r"\bin\s*-\s*lb\.?\b", re.IGNORECASE), "inch-pounds"),
+    (re.compile(r"\bin\s+lbs?\b", re.IGNORECASE), "inch-pounds"),
     (re.compile(r"\bN\s*[·•\.]\s*m\b"), "newton-meters"),
     (re.compile(r"\bN\s*-\s*m\b"), "newton-meters"),
     (re.compile(r"\bNm\b"), "newton-meters"),
@@ -184,7 +187,26 @@ def _query_hint_tokens(query: str) -> set[str]:
     return {hint for hint in _QUERY_TORQUE_HINTS if hint in lowered}
 
 
-def _score_row(application: str, notes: str, torque: str, hints: set[str]) -> int:
+def _query_content_tokens(query: str) -> set[str]:
+    stop = {
+        "a", "an", "the", "for", "and", "or", "of", "to", "on", "in", "what",
+        "whats", "is", "are", "me", "my", "please", "spec", "specs",
+    }
+    tokens = set()
+    for raw in query.lower().replace("/", " ").replace("-", " ").split():
+        token = "".join(ch for ch in raw if ch.isalnum())
+        if len(token) >= 3 and token not in stop:
+            tokens.add(token)
+    return tokens
+
+
+def _score_row(
+    application: str,
+    notes: str,
+    torque: str,
+    hints: set[str],
+    query_tokens: set[str] | None = None,
+) -> int:
     haystack = f"{application} {notes} {torque}".lower()
     score = 0
     if _row_has_unit(haystack):
@@ -192,6 +214,10 @@ def _score_row(application: str, notes: str, torque: str, hints: set[str]) -> in
     for hint in hints:
         if hint in haystack:
             score += 5
+    if query_tokens:
+        for token in query_tokens:
+            if token in haystack:
+                score += 8
     if "final" in haystack:
         score += 3
     if "initial" in haystack or "first" in haystack:
@@ -234,12 +260,19 @@ def _compose_spec_sentence(application: str, torque: str, notes: str) -> str:
 
 def _compose_warning_sentence(caution_text: str) -> str:
     caution = to_single_line(expand_mechanical_units(caution_text))
-    if not caution:
+    caution = re.sub(
+        r"^(?:warning|caution|note|important)\b\s*[:\-!]+\s*",
+        "",
+        caution,
+        flags=re.I,
+    )
+    caution = caution.strip(" \t:-*!")
+    # Drop truncated / empty cautions like "!" left over from OCR noise.
+    if len(caution) < 12:
         return ""
-    if caution.lower().startswith(("warning", "caution", "note", "important")):
-        body = caution
-    else:
-        body = f"Caution: {caution}"
+    body = caution
+    if not body.lower().startswith(("warning", "caution", "note", "important")):
+        body = f"Caution: {body}"
     if not body.endswith("."):
         body = f"{body}."
     return to_single_line(body)
@@ -273,6 +306,7 @@ def format_voice_answer(chunk_text: str, query: str) -> str:
         mapping = {}
 
     hints = _query_hint_tokens(query)
+    query_tokens = _query_content_tokens(query)
     scored: list[tuple[int, str, str, str]] = []
 
     for row in body_rows:
@@ -292,7 +326,13 @@ def format_voice_answer(chunk_text: str, query: str) -> str:
             notes = row[2].strip() if len(row) > 2 else ""
 
         joined = f"{application} {torque} {notes}"
-        score = _score_row(application, notes, torque, hints)
+        score = _score_row(
+            application,
+            notes,
+            torque,
+            hints,
+            query_tokens=query_tokens,
+        )
         if score <= 0 and not _row_has_unit(joined) and not hints:
             score = 1
         scored.append((score, application, torque, notes))
@@ -329,6 +369,54 @@ def format_voice_answer(chunk_text: str, query: str) -> str:
     return to_single_line(expand_mechanical_units(clipped))
 
 
+def _payload_text(hit: Any) -> str | None:
+    payload = getattr(hit, "payload", None) or {}
+    if not isinstance(payload, dict):
+        return None
+    text = payload.get("text")
+    if not isinstance(text, str) or not text.strip():
+        return None
+    return text
+
+
+def _query_vector_for(
+    embedder: TextEmbedding,
+    query: str,
+    year: str,
+    make: str,
+    model: str,
+) -> list[float] | None:
+    # Fold vehicle context into the embedding so semantic fallback still
+    # prefers chunks that mention related applications / torque language.
+    vehicle_bits = [part for part in (year, make, model) if part]
+    embed_text = query
+    if vehicle_bits:
+        embed_text = f"{query} {' '.join(vehicle_bits)}".strip()
+
+    vectors = list(embedder.embed([embed_text]))
+    if not vectors:
+        return None
+    return list(vectors[0])
+
+
+def _search_points(
+    client: QdrantClient,
+    query_vector: list[float],
+    query_filter: qmodels.Filter | None,
+    limit: int = 1,
+) -> list[Any]:
+    response = client.query_points(
+        collection_name=COLLECTION_NAME,
+        query=query_vector,
+        query_filter=query_filter,
+        limit=limit,
+        with_payload=True,
+    )
+    if response is None or not response.points:
+        return []
+    return list(response.points)
+
+
 def search_top_chunk(
     client: QdrantClient,
     embedder: TextEmbedding,
@@ -337,44 +425,78 @@ def search_top_chunk(
     make: str,
     model: str,
 ) -> str | None:
-    vectors = list(embedder.embed([query]))
-    if not vectors:
-        return None
-    query_vector = list(vectors[0])
+    """Hybrid retrieval: exact metadata first, then soft match, then semantic.
 
-    metadata_filter = qmodels.Filter(
-        must=[
+    Exact year/make/model matches are preferred when present in Qdrant, but
+    mismatched or fuzzy vehicle strings still return the closest technical
+    chunk via unfiltered vector similarity.
+    """
+    query_vector = _query_vector_for(embedder, query, year, make, model)
+    if query_vector is None:
+        return None
+
+    # Pass 1 — strict AND filter (character-for-character metadata match).
+    if year and make and model:
+        strict_filter = qmodels.Filter(
+            must=[
+                qmodels.FieldCondition(
+                    key="year",
+                    match=qmodels.MatchValue(value=year),
+                ),
+                qmodels.FieldCondition(
+                    key="make",
+                    match=qmodels.MatchValue(value=make),
+                ),
+                qmodels.FieldCondition(
+                    key="model",
+                    match=qmodels.MatchValue(value=model),
+                ),
+            ]
+        )
+        hits = _search_points(client, query_vector, strict_filter, limit=1)
+        text = _payload_text(hits[0]) if hits else None
+        if text:
+            return text
+
+    # Pass 2 — soft OR filter: any provided vehicle field may match.
+    soft_should: list[qmodels.FieldCondition] = []
+    if year:
+        soft_should.append(
             qmodels.FieldCondition(
                 key="year",
                 match=qmodels.MatchValue(value=year),
-            ),
+            )
+        )
+    if make:
+        soft_should.append(
             qmodels.FieldCondition(
                 key="make",
                 match=qmodels.MatchValue(value=make),
-            ),
+            )
+        )
+    if model:
+        soft_should.append(
             qmodels.FieldCondition(
                 key="model",
                 match=qmodels.MatchValue(value=model),
+            )
+        )
+    if soft_should:
+        soft_filter = qmodels.Filter(
+            min_should=qmodels.MinShould(
+                conditions=soft_should,
+                min_count=1,
             ),
-        ]
-    )
-
-    response = client.query_points(
-        collection_name=COLLECTION_NAME,
-        query=query_vector,
-        query_filter=metadata_filter,
-        limit=1,
-        with_payload=True,
-    )
-    hits = response.points if response is not None else []
+        )
+        hits = _search_points(client, query_vector, soft_filter, limit=1)
+        text = _payload_text(hits[0]) if hits else None
+        if text:
+            return text
+    # Pass 3 — pure semantic fallback (no metadata lock).
+    hits = _search_points(client, query_vector, query_filter=None, limit=1)
     if not hits:
         return None
-
-    payload = hits[0].payload or {}
-    text = payload.get("text")
-    if not isinstance(text, str) or not text.strip():
-        return None
-    return text
+    return _payload_text(hits[0])
 
 
 def _coerce_string(value: Any) -> str:
