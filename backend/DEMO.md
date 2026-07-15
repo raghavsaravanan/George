@@ -14,10 +14,10 @@ Parse Markdown is cached in `.george_parse_cache/` (gitignored). Re-ingest does 
 ## Start for a Call test (3 terminals)
 
 ```bash
-cd /Users/raghav.s18/Documents/Projects/George
+cd /Users/raghav.s18/Documents/Projects/George/backend
 
 # Terminal 1 — API (only one process; holds local Qdrant lock)
-.venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000
+../.venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000
 
 # Terminal 2 — tunnel
 ngrok http 8000
@@ -35,7 +35,7 @@ https://YOUR-SERVICE.onrender.com/vapi-tool
 
 ## Vapi webhook secret (`x-vapi-secret`)
 
-`.env` must have matching `VAPI_WEBHOOK_SECRET=...` (restart uvicorn after changes).
+`backend/.env` must have matching `VAPI_WEBHOOK_SECRET=...` (restart uvicorn after changes).
 This is **not** on the **API Keys** page (Private/Public keys are for calling Vapi).
 This is **not** **Encryption Settings**.
 
@@ -46,7 +46,7 @@ This is **not** **Encryption Settings**.
 3. Find **Headers** (often near Auth / Request / Advanced — not Encryption)
 4. Add header:
    - Name: `X-Vapi-Secret`
-   - Value: same string as `VAPI_WEBHOOK_SECRET` in `.env`
+   - Value: same string as `VAPI_WEBHOOK_SECRET` in `backend/.env`
 5. Save
 
 ### Alternate: Custom Credential
@@ -123,10 +123,12 @@ Looks up torque and fastener specs from shop manuals. ALWAYS call for every new 
 ## Re-seed (credit-safe)
 
 ```bash
-.venv/bin/python ingest.py "intake_manifold_guide.pdf.pdf" \
+cd /Users/raghav.s18/Documents/Projects/George/backend
+
+../.venv/bin/python ingest.py "intake_manifold_guide.pdf.pdf" \
   --year 2019 --make chevrolet --model silverado
 
-.venv/bin/python ingest.py "AMS Performance VR30 Guide.pdf" \
+../.venv/bin/python ingest.py "AMS Performance VR30 Guide.pdf" \
   --year 2016 --make nissan --model vr30
 ```
 
@@ -149,6 +151,8 @@ curl -s -X POST "http://127.0.0.1:8000/vapi-tool" \
   -H "x-vapi-secret: YOUR_SECRET_HERE" \
   -d '{"query":"lower intake manifold torque AMS VR30"}'
 ```
+
+Run the API from `backend/` so `.env` and local paths resolve correctly.
 
 ## Credit rules
 

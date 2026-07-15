@@ -3,13 +3,13 @@
 Hands-free voice RAG for automotive technicians. Ask torque and install specs out loud; George answers in one or two clear sentences from shop manuals — not from guesswork.
 
 ```text
-┌─────────────┐     ┌──────────────┐     ┌─────────────────┐
-│ Manual PDFs │ ──► │  ingest.py   │ ──► │ Qdrant Cloud    │
-│ (local only)│     │ LlamaParse + │     │ george_specs    │
-└─────────────┘     │ FastEmbed    │     │ + shop_id       │
-                    └──────────────┘     └────────┬────────┘
-                                                  │
-Mechanic ──► Vapi ──► Render main.py /vapi-tool ◄─┘
+┌─────────────┐     ┌──────────────────┐     ┌─────────────────┐
+│ Manual PDFs │ ──► │ backend/ingest.py│ ──► │ Qdrant Cloud    │
+│ (local only)│     │ LlamaParse +     │     │ george_specs    │
+└─────────────┘     │ FastEmbed        │     │ + shop_id       │
+                    └──────────────────┘     └────────┬────────┘
+                                                      │
+Mechanic ──► Vapi ──► Render backend/main.py /vapi-tool ◄─┘
                          FastEmbed search
                          spoken 1–2 sentences ──► headset
 ```
@@ -18,8 +18,8 @@ Mechanic ──► Vapi ──► Render main.py /vapi-tool ◄─┘
 
 | File | Role | When it runs |
 | --- | --- | --- |
-| `ingest.py` | Offline seeder | You add/update PDFs (laptop / CI) |
-| `main.py` | Live Vapi webhook | Every Call / tool hit (Render) |
+| `backend/ingest.py` | Offline seeder | You add/update PDFs (laptop / CI) |
+| `backend/main.py` | Live Vapi webhook | Every Call / tool hit (Render) |
 
 Decoupled on purpose: eating manuals is slow and credit-sensitive; answering must stay sub-second.
 
@@ -27,20 +27,24 @@ Decoupled on purpose: eating manuals is slow and credit-sensitive; answering mus
 
 ```text
 George/
-├── main.py              # FastAPI /vapi-tool + /health (Render)
-├── ingest.py            # PDF → chunks → Qdrant Cloud
-├── purge_db.py          # Wipe/recreate empty george_specs
-├── setup.sh             # Quick prerequisite check
-├── requirements.txt
-├── Procfile             # Render start command
-├── render.yaml          # Render Blueprint
-├── runtime.txt          # Python 3.12
-├── DEMO.md              # Shop-demo runbook
-├── tests/               # Unit tests (formatters / normalizer)
-├── .env.example         # Env template (no secrets)
-├── *.pdf                # Local manuals only (gitignored)
-├── george_mvp_db/       # Optional local Qdrant (gitignored)
-└── .george_parse_cache/ # Parse cache (gitignored)
+├── backend/                 # FastAPI + ingest + Qdrant tooling
+│   ├── main.py              # /vapi-tool, /upload, /health
+│   ├── ingest.py            # PDF → chunks → Qdrant Cloud
+│   ├── purge_db.py          # Wipe/recreate empty george_specs
+│   ├── setup.sh             # Prerequisite check
+│   ├── requirements.txt
+│   ├── Procfile             # Render start (used with rootDir)
+│   ├── runtime.txt          # Python 3.12
+│   ├── DEMO.md              # Shop-demo runbook
+│   ├── tests/
+│   ├── .env.example
+│   ├── *.pdf                # Local manuals only (gitignored)
+│   ├── george_mvp_db/       # Optional local Qdrant (gitignored)
+│   └── .george_parse_cache/ # Parse cache (gitignored)
+├── frontend/                # UI (placeholder for now)
+├── render.yaml              # Render Blueprint (rootDir: backend)
+├── README.md
+└── .gitignore
 ```
 
 **Note:** PDF manuals are kept on disk for ingest but are **not** tracked in git. Runtime answers come from Qdrant Cloud.
@@ -79,8 +83,9 @@ PDF
 | AMS VR30 guide | 2016 · nissan · vr30 |
 
 ```bash
-python ingest.py "intake_manifold_guide.pdf.pdf" --year 2019 --make chevrolet --model silverado
-python ingest.py "AMS Performance VR30 Guide.pdf" --year 2016 --make nissan --model vr30
+cd backend
+../.venv/bin/python ingest.py "intake_manifold_guide.pdf.pdf" --year 2019 --make chevrolet --model silverado
+../.venv/bin/python ingest.py "AMS Performance VR30 Guide.pdf" --year 2016 --make nissan --model vr30
 # PDF changed? add --force-parse   | hard scan? add --premium
 ```
 
@@ -116,7 +121,8 @@ python ingest.py "AMS Performance VR30 Guide.pdf" --year 2016 --make nissan --mo
 
 ```bash
 # Terminal 1
-.venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000
+cd backend
+../.venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000
 
 # Terminal 2
 ngrok http 8000
@@ -124,15 +130,16 @@ ngrok http 8000
 
 Vapi tool `lookup_spec` Server URL: `https://YOUR-NGROK-HOST/vapi-tool`
 
-See [DEMO.md](DEMO.md) for smoke questions and curl examples.
+See [backend/DEMO.md](backend/DEMO.md) for smoke questions and curl examples.
 
 ## Deploy API on Render
 
-The live webhook is [`main.py`](main.py). Ingest stays on your laptop (or CI) against Qdrant Cloud — do **not** run `ingest.py` as the Render web process.
+The live webhook is [`backend/main.py`](backend/main.py). Ingest stays on your laptop (or CI) against Qdrant Cloud — do **not** run `ingest.py` as the Render web process.
 
 1. Push this repo to GitHub (secrets stay in Render env vars, never in git).
-2. [Render](https://dashboard.render.com) → **New** → **Blueprint** (uses [`render.yaml`](render.yaml))  
+2. [Render](https://dashboard.render.com) → **New** → **Blueprint** (uses [`render.yaml`](render.yaml) with `rootDir: backend`)  
    or **Web Service** from the repo with:
+   - **Root Directory:** `backend`
    - **Build:** `pip install -r requirements.txt`
    - **Start:** `uvicorn main:app --host 0.0.0.0 --port $PORT`
    - **Health check path:** `/health`
@@ -162,9 +169,9 @@ The live webhook is [`main.py`](main.py). Ingest stays on your laptop (or CI) ag
 
 | Layer | Choice |
 | --- | --- |
-| Parse | LlamaParse (`cost_effective`) + local `.george_parse_cache/` |
+| Parse | LlamaParse (`cost_effective`) + local `backend/.george_parse_cache/` |
 | Embed | FastEmbed local CPU (also on Render) |
-| Store | Qdrant Cloud `george_specs` (local `./george_mvp_db` for offline only) |
+| Store | Qdrant Cloud `george_specs` (local `backend/george_mvp_db` for offline only) |
 | API | FastAPI on Render |
 | Voice | Vapi (WebRTC + STT/TTS) |
 | Tunnel | Ngrok (local dev only) |

@@ -19,7 +19,7 @@ George is an autonomous, hands-free, low-latency voice-first AI assistant built 
 The architecture leverages maximum developer free tiers to eliminate financial overhead during R&D validation:
 
 *   **Ingestion Engine (LlamaIndex Cloud / LlamaParse)**: Allocated 1,000 free parsed pages per month. Used to run layout-aware agentic document analysis to turn messy technical manuals into structurally intact Markdown data tables.
-*   **Vector Database (Qdrant Client)**: Operating as a local, zero-cost, file-based database instance inside the project root directory (`./george_mvp_db`).
+*   **Vector Database (Qdrant Client)**: Cloud-first (`QDRANT_URL`); optional local file-based fallback under `backend/george_mvp_db`.
 *   **Local Embeddings (FastEmbed)**: Embedded directly into the Python pipeline to generate vector representations locally on CPU without making external API calls.
 *   **Voice Pipeline-as-a-Service (Vapi Platform)**: Handles real-time WebRTC orchestration, hardware noise cancelation, Deepgram Speech-to-Text transcription, and ElevenLabs Text-to-Speech synthesis out of the box using promotional developer credits.
 *   **LLM Core & Token Processing (OpenAI API / Google AI Studio)**: Powers the conversational reasoning engine behind the Vapi assistant profile and drives precision context analysis.
@@ -38,7 +38,7 @@ Unstructured FSM Manual (.txt/.pdf)
 Mechanic Voice ──> Vapi Pipeline (WebRTC + Audio Denoising)
 │
 ▼ (Triggers Custom Function Hook HTTP POST JSON)
-Local FastAPI Server (main.py)
+Local FastAPI Server (backend/main.py)
 │
 ▼ (Executes Metadata-Filtered Hybrid-RAG Search)
 Qdrant Vector DB (Validates strict Year/Make/Model match)
@@ -52,7 +52,7 @@ Vapi Audio Out ──> Mechanic Headset (Sub-800ms Round Trip)
 
 When executing code modifications or structural planning, Cursor must rigorously enforce the following engineering constraints:
 
-1. **Decoupled Architecture**: Codebases must remain physically separate. `ingest.py` handles offline database structural seeding. `main.py` serves the live webhook API routes.
+1. **Decoupled Architecture**: Repo is split into `backend/` (API + ingest) and `frontend/` (UI). Within the backend, `ingest.py` handles offline database structural seeding and `main.py` serves the live webhook API routes — keep those roles separate.
 2. **Data Structure Safety**: Technical text fragments must never clip tables across vector boundaries. Data configurations must cleanly isolate tables using strict Markdown syntax (`| column |`).
 3. **Verbal Conciseness Rule**: Text strings generated for Vapi tools must be structurally optimized for audio consumption. Limit strings to 1-2 direct sentences max. No conversational filler or long blocks of text.
 4. **Mechanical Unit Preservation Trap**: To prevent catastrophic mechanical failures (e.g., stripping aluminum cylinder threads), torque and liquid values must be explicitly spelled out in plain text (e.g., write out `"inch-pounds"` or `"foot-pounds"` completely; never return abbreviations like `"lb-in"` or `"lb-ft"`).
