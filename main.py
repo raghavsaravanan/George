@@ -1073,18 +1073,14 @@ async def vapi_tool(request: Request) -> JSONResponse:
 
         if chunk_text is None:
             outcome = "not_found"
+            # Hard fail when every hybrid pass misses for this shop_id.
             return JSONResponse(
                 status_code=200,
                 content={
-                    "results": [
-                        {
-                            "toolCallId": "vapi-call",
-                            "result": (
-                                "ERROR: SPEC_NOT_FOUND. I do not have that "
-                                "spec in the manuals."
-                            ),
-                        }
-                    ]
+                    "result": (
+                        "ERROR: SPEC_NOT_FOUND. I do not have that "
+                        "spec in the manuals."
+                    )
                 },
             )
 
