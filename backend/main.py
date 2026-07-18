@@ -969,7 +969,7 @@ def _coerce_string(value: Any) -> str:
 
 
 def extract_tool_arguments(tool_call: dict[str, Any]) -> dict[str, str]:
-    """Pull query/make/model/year from a Vapi toolCallList entry safely."""
+    """Pull query/make/model/year/shop_id from a Vapi toolCallList entry safely."""
     raw_args: Any = tool_call.get("parameters")
     if raw_args is None:
         raw_args = tool_call.get("arguments")
@@ -1003,6 +1003,55 @@ def extract_tool_arguments(tool_call: dict[str, Any]) -> dict[str, str]:
         "make": _coerce_string(raw_args.get("make")).lower(),
         "model": _coerce_string(raw_args.get("model")).lower(),
         "year": _coerce_string(raw_args.get("year")).lower(),
+        "shop_id": _coerce_string(raw_args.get("shop_id")).lower(),
+    }
+
+
+def normalize_vapi_lookup_payload(payload: dict[str, Any]) -> dict[str, str]:
+    """Accept flat apiRequest bodies or nested message.toolCallList webhooks."""
+    query = str(payload.get("query") or "").strip()
+    make = str(payload.get("make") or "").strip().lower()
+    model = str(payload.get("model") or "").strip().lower()
+    year = str(payload.get("year") or "").strip().lower()
+    shop_id = str(payload.get("shop_id") or "").strip().lower()
+    tool_call_id = _extract_tool_call_id(payload)
+
+    if not query:
+        tool_calls = extract_tool_call_list(payload)
+        if tool_calls:
+            first = tool_calls[0]
+            tool_call_id = extract_tool_call_id(first, 0)
+            args = extract_tool_arguments(first)
+            query = args.get("query") or ""
+            make = make or args.get("make") or ""
+            model = model or args.get("model") or ""
+            year = year or args.get("year") or ""
+            shop_id = shop_id or args.get("shop_id") or ""
+
+    # Some apiRequest configs nest fields under "parameters".
+    if not query:
+        nested = payload.get("parameters")
+        if isinstance(nested, str):
+            import json
+
+            try:
+                nested = json.loads(nested)
+            except json.JSONDecodeError:
+                nested = {}
+        if isinstance(nested, dict):
+            query = str(nested.get("query") or "").strip()
+            make = make or str(nested.get("make") or "").strip().lower()
+            model = model or str(nested.get("model") or "").strip().lower()
+            year = year or str(nested.get("year") or "").strip().lower()
+            shop_id = shop_id or str(nested.get("shop_id") or "").strip().lower()
+
+    return {
+        "query": query,
+        "make": make,
+        "model": model,
+        "year": year,
+        "shop_id": shop_id or DEFAULT_SHOP_ID,
+        "tool_call_id": tool_call_id or "vapi-call",
     }
 
 
@@ -1428,13 +1477,14 @@ async def vapi_tool(request: Request) -> JSONResponse:
             },
         )
 
-    query = str(payload.get("query") or "").strip()
-    make = str(payload.get("make") or "").strip().lower()
-    model = str(payload.get("model") or "").strip().lower()
-    year = str(payload.get("year") or "").strip().lower()
-    shop_id = str(payload.get("shop_id") or "").strip().lower() or DEFAULT_SHOP_ID
+    fields = normalize_vapi_lookup_payload(payload)
+    query = fields["query"]
+    make = fields["make"]
+    model = fields["model"]
+    year = fields["year"]
+    shop_id = fields["shop_id"] or DEFAULT_SHOP_ID
     call_id = _extract_call_id(payload)
-    tool_call_id = _extract_tool_call_id(payload)
+    tool_call_id = fields["tool_call_id"]
 
     if not query:
         return JSONResponse(
