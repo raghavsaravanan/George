@@ -1,14 +1,16 @@
 # Render Blueprint — George voice webhook API
 # Docs: https://render.com/docs/blueprint-spec
+#
+# Paths are repo-root relative (no rootDir) so existing Render services
+# keep working after the backend/frontend split.
 services:
   - type: web
     name: george-api
     runtime: python
     plan: free
     region: oregon
-    rootDir: backend
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    buildCommand: pip install -r backend/requirements.txt
+    startCommand: cd backend && uvicorn main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
     envVars:
       - key: PYTHON_VERSION

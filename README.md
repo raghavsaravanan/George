@@ -137,11 +137,11 @@ See [backend/DEMO.md](backend/DEMO.md) for smoke questions and curl examples.
 The live webhook is [`backend/main.py`](backend/main.py). Ingest stays on your laptop (or CI) against Qdrant Cloud — do **not** run `ingest.py` as the Render web process.
 
 1. Push this repo to GitHub (secrets stay in Render env vars, never in git).
-2. [Render](https://dashboard.render.com) → **New** → **Blueprint** (uses [`render.yaml`](render.yaml) with `rootDir: backend`)  
+2. [Render](https://dashboard.render.com) → **New** → **Blueprint** (uses [`render.yaml`](render.yaml))  
    or **Web Service** from the repo with:
-   - **Root Directory:** `backend`
-   - **Build:** `pip install -r requirements.txt`
-   - **Start:** `uvicorn main:app --host 0.0.0.0 --port $PORT`
+   - **Root Directory:** leave blank (repo root)
+   - **Build:** `pip install -r backend/requirements.txt`
+   - **Start:** `cd backend && uvicorn main:app --host 0.0.0.0 --port $PORT`
    - **Health check path:** `/health`
 3. Set environment variables (Dashboard → Environment):
 

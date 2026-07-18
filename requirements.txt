@@ -1,0 +1,2 @@
+# Thin wrapper so Render/local tools that expect a root requirements.txt still work.
+-r backend/requirements.txt
