@@ -1063,13 +1063,29 @@ def extract_tool_call_id(tool_call: dict[str, Any], index: int) -> str:
 
 
 def extract_tool_call_list(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Collect tool-call dicts from common Vapi webhook shapes."""
+
+    def _from_list(raw: Any) -> list[dict[str, Any]]:
+        if not isinstance(raw, list):
+            return []
+        return [item for item in raw if isinstance(item, dict)]
+
+    # Flat / legacy: toolCallList at payload root.
+    top = _from_list(payload.get("toolCallList")) or _from_list(
+        payload.get("toolCalls")
+    )
+    if top:
+        return top
+
     message = payload.get("message")
     if not isinstance(message, dict):
         return []
 
-    tool_call_list = message.get("toolCallList")
-    if isinstance(tool_call_list, list):
-        return [item for item in tool_call_list if isinstance(item, dict)]
+    tool_call_list = _from_list(message.get("toolCallList")) or _from_list(
+        message.get("toolCalls")
+    )
+    if tool_call_list:
+        return tool_call_list
 
     tool_with_list = message.get("toolWithToolCallList")
     if isinstance(tool_with_list, list):
@@ -1084,6 +1100,13 @@ def extract_tool_call_list(payload: dict[str, Any]) -> list[dict[str, Any]]:
                     merged["name"] = item["name"]
                 if "parameters" not in merged and "parameters" in item:
                     merged["parameters"] = item["parameters"]
+                # Older embeds: toolCall.function.parameters
+                function_block = nested.get("function")
+                if isinstance(function_block, dict):
+                    if "parameters" not in merged and "parameters" in function_block:
+                        merged["parameters"] = function_block["parameters"]
+                    if "arguments" not in merged and "arguments" in function_block:
+                        merged["arguments"] = function_block["arguments"]
                 recovered.append(merged)
             else:
                 recovered.append(item)
@@ -1485,6 +1508,17 @@ async def vapi_tool(request: Request) -> JSONResponse:
     shop_id = fields["shop_id"] or DEFAULT_SHOP_ID
     call_id = _extract_call_id(payload)
     tool_call_id = fields["tool_call_id"]
+
+    logger.info(
+        "vapi_tool inbound keys=%s tool_calls=%d has_query=%s "
+        "query_preview=%r shop_id=%r toolCallId=%r",
+        sorted(payload.keys()),
+        len(extract_tool_call_list(payload)),
+        bool(query),
+        (query[:120] if query else None),
+        shop_id,
+        tool_call_id,
+    )
 
     if not query:
         return JSONResponse(
